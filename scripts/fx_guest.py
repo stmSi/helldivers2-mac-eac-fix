@@ -16,7 +16,7 @@ class Guest:
         disk = Path(os.environ.get("FX_DISK", str(Path.home() / "Library/Application Support/es.fxgam.steamac/steamos.img")))
         result = subprocess.run(
             [str(app / "Contents/MacOS/steamac-vm"), "--no-crash-reports", "--ssh-password", str(disk)],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, timeout=90, check=False,
         )
         fields = dict(line.split(" ", 1) for line in result.stdout.splitlines() if " " in line)
         if result.returncode or not fields.get("password"):

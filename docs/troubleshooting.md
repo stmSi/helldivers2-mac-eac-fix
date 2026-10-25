@@ -3,7 +3,8 @@
 | Symptom | Check |
 |---|---|
 | Mac Wine says unsupported | Use Steam inside FX's Linux guest. This guide does not use Whisky. |
-| EAC loads, then game stalls | Confirm the patched FEX is installed, x86 public Proton Experimental is selected, and `FEX_DISKCACHE=0` is present. |
+| EAC loads, then game stalls | Confirm patched FEX, x86 public Proton Experimental, and the local HD2 profile. Run `./install.command status`. |
+| Switching Steam accounts breaks launch | Keep Launch Options empty and run `./install.command profile` once. See [local profile](local-profile.md). |
 | Black screen on first start | Shader compilation took about 5–6 minutes in one tested D3D12 run. Give active compilation time. |
 | EAC network-connect error | A normal retry cleared this once; the cause was not isolated. No firewall or network-spoofing change is part of this setup. |
 | Fine grid / stripes | Disable anti-aliasing. See [graphics limits](graphics.md). |
@@ -34,6 +35,6 @@ Quit FX, then run from this repository:
 defaults import es.fxgam.steamac .local-state/fx-preferences.before.plist
 ```
 
-Remove the custom HD2 launch options in Steam when undoing the setup. To undo the optional shortcut build, restore the original app from `.local-state/shortcut/FX Steam Launcher.original.app` while FX is closed.
+The restore command also removes the FX-local launch wrapper. Keep HD2's Steam Launch Options empty. To undo the optional shortcut build, restore the original app from `.local-state/shortcut/FX Steam Launcher.original.app` while FX is closed.
 
 For bug reports, include hardware, macOS, FX/Proton/FEX versions and the failing step. Redact account IDs and credentials from logs before sharing them.

@@ -46,7 +46,7 @@ Open FX again, keep Steam open, and stop games. In the cloned repository on the 
 ./install.command
 ```
 
-The command creates a local Python environment, connects only to your FX VM, installs missing compiler packages if needed, builds the pinned FEX sources, and replaces Steam's FEX runtime after backing it up. Missing compiler packages require guest sudo; the helper uses FX's existing generated guest password in memory.
+The command creates a local Python environment, connects only to your FX VM, installs missing compiler packages if needed, builds the pinned FEX sources, and replaces Steam's FEX runtime after backing it up. It installs the [FX-local HD2 profile](local-profile.md) and briefly restarts Steam. Missing compiler packages require guest sudo; the helper uses FX's existing generated guest password in memory.
 
 The build uses four jobs. For less memory pressure:
 
@@ -54,11 +54,11 @@ The build uses four jobs. For less memory pressure:
 ./install.command --jobs 2
 ```
 
-Your game files and Steam account/session files are not copied or edited. Setup does not change your Steam Friends status.
+Game files and credentials are not changed. The profile migration clears only the old FX launch-options entry for HD2 in cached local account configs; private backups stay in the VM. Setup does not change your Steam Friends status.
 
 ## 5. Launch
 
-Use the launch options in the [README](../README.md), then play normally through Steam. Keep EAC enabled. If HD2 shows the unknown/outdated graphics-driver dialog, choose Continue.
+Leave Steam's HD2 Launch Options empty, then play normally. The local profile supplies the settings independently of your Steam account. Keep EAC enabled. If HD2 shows the unknown/outdated graphics-driver dialog, choose Continue.
 
 First-start shader compilation can take several minutes. Apply the [graphics settings](graphics.md) after the scene loads.
 

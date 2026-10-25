@@ -1,6 +1,6 @@
 # Graphics and FPS
 
-The faster tested path is **DXMT + DirectX 11**. FX must use DXMT, and HD2's launch options must end in `--use-d3d11`.
+The faster tested path is **DXMT + DirectX 11**. FX must use DXMT; the local HD2 profile supplies `--use-d3d11` automatically. Leave Steam Launch Options empty.
 
 Set these in HD2 and Apply:
 
@@ -26,6 +26,6 @@ Observed ship readings were about **84–90 FPS** on an M5 Pro, 24 GB, at 1512×
 
 ## Alternative renderer
 
-For troublesome DXMT rendering: quit FX, select Vulkan/KosmicKrisp in its settings, restart, and remove `--use-d3d11` from HD2's launch options. This returns to DirectX 12.
+For troublesome DXMT rendering: quit FX, select Vulkan/KosmicKrisp, restart, then run `./install.command profile --renderer vulkan` on the Mac. This returns to DirectX 12 without account-level launch options.
 
 The tested D3D12 ship readings were roughly 44–52 FPS. DX11 through DXVK/Vulkan produced a GPU timeout in this investigation, so it is not the recommended fallback.

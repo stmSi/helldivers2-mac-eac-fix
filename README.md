@@ -24,13 +24,9 @@ Requires Apple Command Line Tools (`xcode-select --install`).
    ./install.command
    ```
 
-5. Paste this into HD2 → Properties → Launch Options:
+5. Leave HD2's **Steam Launch Options empty**. Start HD2 and use **Medium → Native render scale → Anti-aliasing Off → Motion Blur 0**. [Graphics](docs/graphics.md).
 
-   ```text
-   env FEX_NEEDSSECCOMP=1 FEX_DISKCACHE=0 PROTON_LOG=0 WINEDEBUG=-all PROTON_USE_XALIA=0 PROTON_EAC_RUNTIME="$HOME/.local/share/Steam/steamapps/common/Proton EasyAntiCheat Runtime" %command% --use-d3d11
-   ```
-
-6. Start HD2. Use **Medium → Native render scale → Anti-aliasing Off → Motion Blur 0**. [Graphics](docs/graphics.md).
+The installer keeps HD2's options **inside FX's Linux runtime**, across Steam account switches. Your Windows Steam launch stays normal. Existing installs can migrate with `git pull` followed by `./install.command profile`. [Local profile](docs/local-profile.md).
 
 First setup builds FEX from source; allow several minutes. First launch may also compile shaders.
 

@@ -15,7 +15,7 @@ jobs:
       - name: Check shell and Python syntax
         run: |
           bash -n install.command configure-fx.command scripts/build-fx-shortcut.sh
-          sh -n guest/build-fex.sh guest/dependencies.sh
-          python3 -m py_compile scripts/fx_guest.py scripts/setup.py guest/install_fex.py
+          sh -n guest/build-fex.sh guest/dependencies.sh guest/hd2-launcher.sh
+          python3 -m py_compile scripts/fx_guest.py scripts/setup.py guest/install_fex.py guest/hd2_profile.py
       - name: Test runtime backup, rollback, restore and documentation
         run: python3 -m unittest discover -s tests -v
