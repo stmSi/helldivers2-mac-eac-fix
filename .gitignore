@@ -1,0 +1,14 @@
+.DS_Store
+.venv/
+.local-state/
+__pycache__/
+*.pyc
+*.log
+*.dmp
+*.img
+*.dmg
+*.app/
+*.tar*
+*.zip
+known_hosts
+.env*

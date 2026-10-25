@@ -1,0 +1,9 @@
+{
+  "fx_tag": "v1.9-eac.2",
+  "fx_commit": "41c2c0eefbfdba93f43c45fb6f20b007f0eb348e",
+  "fex_tag": "eac-2610.3",
+  "fex_commit": "938eedfcd79eb00e86561fbdf4933770766f0ba9",
+  "fex_patched_tree": "1f5d6eb5046e346f7acdb30b9cadb53661c18b29",
+  "fex_patch_sha256": "6e51fe18a05d9a91ecea24e5b3047b3a8d06cfbb6ef11e47a93cb768d131651f",
+  "fx_shortcut_patch_sha256": "cd08e1f2dec80b5a4bfdbb0ab364770294c619fe27fe857272fe43f7d3280c41"
+}

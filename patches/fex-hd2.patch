@@ -1,0 +1,3547 @@
+From 05af132852b7fa830648cd61a9dd63e09cd537c4 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:59:32 +0300
+Subject: [PATCH 1/8] Signals: report RF in the EFLAGS of a fault's signal
+ frame
+
+What x86-64 Linux does: for a fault-class exception (#UD, #GP, #PF, ...) the CPU pushes an EFLAGS image with RF
+(resume flag, bit 16) set, and the kernel copies that image into uc_mcontext.gregs[REG_EFL] unchanged. A SIGSEGV
+from a page fault, a SIGILL from ud2, a SIGSEGV from a privileged instruction all show RF = 1. Trap-class exceptions
+(#BP from int3, #DB, #OF) and asynchronous signals show RF = 0. rt_sigreturn accepts RF back (FIX_EFLAGS); the CPU
+clears it after the next instruction, PUSHF never stores it and POPF clears it.
+
+What FEX did: the running RF is always 0 and the frame EFLAGS is the reconstructed running EFLAGS, so a fault frame
+had RF = 0. Who observes it: Wine copies the frame EFLAGS into CONTEXT.EFlags, so every PE exception handler sees
+it. A title's own execute-fault handler (THE FINALS, during thread detach) gets EFlags 0x10202 on x86-64 Proton and
+0x00000202 under FEX; it is the only flag difference in those exception records.
+
+Fix:
+* SignalDelegator: when the guest frame is built for a fault (a generated exception whose trap number is not
+  #DB/#BP/#OF, or a host SIGSEGV/SIGBUS on a guest access), set RF in the frame EFLAGS. One branch per guest signal
+  delivery; nothing on any other path.
+* RF never stays in the running state: SetFlagsFromCompactedEFLAGS (rt_sigreturn, Wine context loads) and
+  SetPackedRFLAG (POPF, IRET) store 0. An IRET that loads RF only masks an instruction breakpoint on the next
+  instruction, and FEX has no instruction breakpoints, so this is exact for everything a guest can see; without
+  it Wine's `pushq %r11; popfq` return path would carry RF = 1 into PUSHF and later frames.
+
+Test: eac-tests/fault-eflags (frame EFLAGS = flags before the instruction | RF for #PF read/exec, #UD, #GP;
+RF clear for int3; all 16 GPRs and RIP in the frame, also for an execute fault right after a syscall; PUSHF after
+the handler returns shows RF clear).
+
+Upstream: FEX main as triaged at 14c9268 builds the frame from the running EFLAGS (RF 0) and stores RF from POPF/IRET.
+#DE is not covered: FEX does not raise it for a division by zero (upstream limit, no consumer seen).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/Core.cpp        |  6 +++++
+ .../Interface/Core/OpcodeDispatcher/Flags.cpp |  4 ++++
+ .../LinuxSyscalls/SignalDelegator.cpp         | 22 +++++++++++++++++++
+ 3 files changed, 32 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index cf8b146..56f2dd6 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -339,6 +339,12 @@ void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState
+       // DF is encoded as 1/-1
+       Frame->State.flags[i] = (EFLAGS & (1U << i)) ? 0xff : 1;
+       break;
++    case X86State::RFLAG_RF_LOC:
++      // RF only suppresses an instruction breakpoint on the next instruction, and the CPU clears it once that
++      // instruction completes. FEX has no instruction breakpoints, so a context that loads RF (a signal frame of a
++      // fault, which carries RF = 1) consumes it at once: PUSHF and later signal frames must not see it.
++      Frame->State.flags[i] = 0;
++      break;
+     default: Frame->State.flags[i] = (EFLAGS & (1U << i)) ? 1 : 0; break;
+     }
+   }
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+index 858e7a4..187be5f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher/Flags.cpp
+@@ -60,6 +60,10 @@ void OpDispatchBuilder::SetPackedRFLAG(bool Lower8, Ref Src) {
+     } else if (FlagOffset == FEXCore::X86State::RFLAG_PF_RAW_LOC || FlagOffset == FEXCore::X86State::RFLAG_CF_RAW_LOC) {
+       // PF and CF are both stored parity flipped.
+       SetRFLAG(SrcInverted, FlagOffset, FlagOffset, true);
++    } else if (FlagOffset == FEXCore::X86State::RFLAG_RF_LOC) {
++      // POPF clears RF. IRET loads it, but it only suppresses an instruction breakpoint on the next instruction and
++      // the CPU clears it after that one; FEX has no instruction breakpoints, so it is never visible afterwards.
++      SetRFLAG(Constant(0), FlagOffset);
+     } else {
+       SetRFLAG(Src, FlagOffset, FlagOffset, true);
+     }
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+index 5108e78..6383774 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+@@ -186,6 +186,7 @@ ArchHelpers::Context::ContextBackup* SignalDelegator::StoreThreadState(FEXCore::
+ }
+ 
+ static void CheckForPendingSignals(const FEX::HLE::ThreadStateObject* Thread);
++static bool IsFaultClassException(const FEXCore::Core::CpuStateFrame* Frame, bool GeneratedException, int Signal, const siginfo_t* HostSigInfo);
+ 
+ void SignalDelegator::RestoreThreadState(FEXCore::Core::InternalThreadState* Thread, void* ucontext, RestoreType Type) {
+   uint64_t OldSP {};
+@@ -466,6 +467,9 @@ bool SignalDelegator::HandleDispatcherGuestSignal(FEXCore::Core::InternalThreadS
+ 
+   ContextBackup->OriginalRIP = Thread->CurrentFrame->State.rip;
+   uint32_t eflags = CTX->ReconstructCompactedEFLAGS(Thread, false, nullptr, 0);
++  if (IsFaultClassException(Frame, ContextBackup->FaultToTopAndGeneratedException, Signal, HostSigInfo)) {
++    eflags |= 1U << FEXCore::X86State::RFLAG_RF_LOC;
++  }
+ 
+   if (Is64BitMode) {
+     NewGuestSP = SetupFrame_x64(Thread, ContextBackup, Frame, Signal, HostSigInfo, ucontext, GuestAction, GuestStack, NewGuestSP, eflags);
+@@ -641,6 +645,24 @@ void SignalDelegator::SignalThread(FEXCore::Core::InternalThreadState* Thread, S
+ 
+ /**  @} */
+ 
++// For a fault-class exception the CPU pushes an EFLAGS image with RF (resume flag) set, so that returning to the faulting
++// instruction does not raise an instruction breakpoint on it again; Linux puts that image into the signal frame unchanged
++// (a SIGSEGV from a page fault shows RF = 1 in uc_mcontext). Traps (#DB, #BP, #OF) and asynchronous signals push RF = 0.
++// FEX's running RF is always 0, so the frame gets it here. Only computed while a guest frame is being built.
++static bool IsFaultClassException(const FEXCore::Core::CpuStateFrame* Frame, bool GeneratedException, int Signal, const siginfo_t* HostSigInfo) {
++  if (GeneratedException) {
++    switch (Frame->SynchronousFaultData.TrapNo) {
++    case FEXCore::X86State::X86_TRAPNO_DB:
++    case FEXCore::X86State::X86_TRAPNO_BP:
++    case FEXCore::X86State::X86_TRAPNO_OF: return false;
++    default: return true;
++    }
++  }
++
++  // A guest memory access that faulted on the host: a #PF for the guest.
++  return (Signal == SIGSEGV || Signal == SIGBUS) && HostSigInfo->si_code > SI_USER && HostSigInfo->si_code < SI_KERNEL;
++}
++
+ static bool IsAsyncSignal(const siginfo_t* Info, int Signal) {
+   if (Info->si_code <= SI_USER) {
+     // If the signal is not from the kernel then it is always async.
+-- 
+2.44.0
+
+
+From 15d5037f8cbd8944a18392ba50fbc312411e0511 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:09:28 +0300
+Subject: [PATCH 2/8] JIT: report exec faults on unmapped guest memory as
+ SEGV_MAPERR, like x86
+
+Every instruction fetch that the frontend cannot read because the guest page is not executable
+funnelled into NoExecOp, which raised SIGSEGV with a fixed si_code = SEGV_ACCERR and err =
+PF_PROT|PF_USER|PF_INSTR (0x15): a protection fault. But the fetch can fail for two different
+reasons, and the guest distinguishes them: the page is mapped without execute permission
+(native: SEGV_ACCERR, err 0x15) or the page is not mapped at all (native: SEGV_MAPERR, err 0x14,
+no PF_PROT). FEX reported the protection-fault form for both.
+
+The distinction was already available where the fetch is checked: QueryGuestExecutableRange
+returns a zero range both when the VMA lookup finds nothing and when it finds a mapped,
+non-executable VMA. ExecutableRangeInfo gains a Mapped flag (default true, so the Windows and
+offline-tool query paths keep their meaning), the VMA lookup sets it, the frontend records
+HitUnmappedFetch on a failing range query for an unmapped address, and the new
+DecodedBlockStatus::UNMAPPED_INST routes to a new UnmappedOp that raises SIGSEGV with
+SEGV_MAPERR and err = PF_USER|PF_INSTR (0x14). Mapped-but-noexec keeps the old NoExecOp values.
+Cost: one flag on the fault path only; decode of executable memory is unchanged.
+
+Wine reads exactly these fields when it converts the signal to a Windows exception
+(signal_x86_64.c signal_to_exception): si_code and the error code select the exception and its
+parameters, so a recovery handler sees the right fault kind. A packer that recovers an execute
+AV on a not-yet-mapped page via SEH is one consumer.
+
+tests/segv-regs case 5 (jump to a page the guest munmapped): native x86-64 PASS; FEX reported
+si_code=2 (ACCERR) err=0x15 (FAIL); with this change PASS, err=0x14, matching native. Cases 1-4
+and 6 unchanged, all PASS, as on the 0001-0026 build. Regression set under the new build:
+t_p0, t_term (160/160), seccomp-trap, maps-probe, tf-iret, signal-frame/-mask/-regs all PASS.
+
+Upstream FEX main has the identical NoExecOp with the same hardcoded values (checked via
+GitHub raw, 2026-10-10); there is no MAPERR path for instruction fetch anywhere in FEXCore.
+
+Base: FEX-2610 14c92681 + patches 0001-0026.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/Core.cpp                |  2 ++
+ FEXCore/Source/Interface/Core/Frontend.cpp            |  8 +++++++-
+ FEXCore/Source/Interface/Core/Frontend.h              |  4 ++++
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp    | 11 +++++++++++
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.h      |  1 +
+ FEXCore/include/FEXCore/HLE/SyscallHandler.h          |  3 +++
+ Source/Tools/CommonTools/DummyHandlers.h              |  2 +-
+ .../LinuxSyscalls/SyscallsSMCTracking.cpp             | 11 ++++++++---
+ 8 files changed, 37 insertions(+), 5 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 56f2dd6..1f2e7e4 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -731,6 +731,8 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+               Thread->OpDispatcher->InvalidOp(DecodedInfo);
+             } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNIMPLEMENTED_INST) {
+               Thread->OpDispatcher->UnimplementedOp(DecodedInfo);
++            } else if (Block.BlockStatus == Frontend::Decoder::DecodedBlockStatus::UNMAPPED_INST) {
++              Thread->OpDispatcher->UnmappedOp(DecodedInfo);
+             } else {
+               Thread->OpDispatcher->NoExecOp(DecodedInfo);
+             }
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 6667f16..ff9e28e 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -107,6 +107,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+     ExecutableRangeWritable = RangeInfo.Writable;
+ 
+     if (RangeInfo.Size == 0) {
++      HitUnmappedFetch = !RangeInfo.Mapped;
+       return false;
+     }
+ 
+@@ -1083,6 +1084,7 @@ void Decoder::DecodeREXIfValid(int8_t ExpectedOffset) {
+ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+   // Will be set if DecodeInstructionImpl tries to read non-executable memory
+   HitNonExecutableRange = false;
++  HitUnmappedFetch = false;
+   HitBadRelocation = false;
+   auto ErrorDuringDecoding = DecodeInstructionImpl(PC);
+ 
+@@ -1096,7 +1098,10 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+     // A decode error can be caused by substituting zero for an inaccessible
+     // instruction byte, so the instruction fetch fault takes priority.
+     if (HitNonExecutableRange) {
+-      return InstSize ? DecodedBlockStatus::PARTIAL_DECODE_INST : DecodedBlockStatus::NOEXEC_INST;
++      if (InstSize) {
++        return DecodedBlockStatus::PARTIAL_DECODE_INST;
++      }
++      return HitUnmappedFetch ? DecodedBlockStatus::UNMAPPED_INST : DecodedBlockStatus::NOEXEC_INST;
+     }
+ 
+     if (HitBadRelocation) {
+@@ -1658,6 +1663,7 @@ void Decoder::DecodeLoop(const uint8_t* _InstStream, uint64_t GuestSizePause) {
+           LogMan::Msg::EFmt("{} instruction in entry block: {:X}",
+                             BlockIt->BlockStatus == DecodedBlockStatus::INVALID_INST       ? "Invalid" :
+                             BlockIt->BlockStatus == DecodedBlockStatus::NOEXEC_INST        ? "NoExec" :
++                            BlockIt->BlockStatus == DecodedBlockStatus::UNMAPPED_INST      ? "Unmapped" :
+                             BlockIt->BlockStatus == DecodedBlockStatus::BAD_RELOCATION     ? "BadRelocation" :
+                             BlockIt->BlockStatus == DecodedBlockStatus::UNIMPLEMENTED_INST ? "Unimplemented" :
+                                                                                              "PartialDecode",
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index e62948e..322b8e7 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -27,6 +27,7 @@ public:
+     SUCCESS,
+     INVALID_INST,
+     NOEXEC_INST,
++    UNMAPPED_INST,
+     PARTIAL_DECODE_INST,
+     BAD_RELOCATION,
+     UNIMPLEMENTED_INST,
+@@ -154,6 +155,9 @@ private:
+   uint64_t ExecutableRangeEnd {};
+   bool ExecutableRangeWritable {};
+   bool HitNonExecutableRange {};
++  // True when the last failing executable-range query reported the address as unmapped in the guest view
++  // (no VMA), rather than mapped without execute permission.
++  bool HitUnmappedFetch {};
+   bool HitBadRelocation {};
+ 
+   struct DecodeStream {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 731f912..9c3fdfa 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -5230,5 +5230,16 @@ void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
+               });
+ }
+ 
++void OpDispatchBuilder::UnmappedOp(OpcodeArgs) {
++  // The address is not mapped in the guest view at all: the x86 page-fault error code has no PF_PROT and
++  // si_code is SEGV_MAPERR, unlike a mapped-but-not-executable fetch.
++  BreakOp(Op, FEXCore::IR::BreakDefinition {
++                .ErrorRegister = X86State::X86_PF_USER | X86State::X86_PF_INSTR,
++                .Signal = Core::FAULT_SIGSEGV,
++                .TrapNumber = X86State::X86_TRAPNO_PF,
++                .si_code = 1, // SEGV_MAPERR
++              });
++}
++
+ #undef OpcodeArgs
+ } // namespace FEXCore::IR
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index b02dbdf..f493402 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -1130,6 +1130,7 @@ public:
+ 
+   void InvalidOp(OpcodeArgs);
+   void NoExecOp(OpcodeArgs);
++  void UnmappedOp(OpcodeArgs);
+ 
+   void SetPackedRFLAG(bool Lower8, Ref Src);
+   Ref GetPackedRFLAG(uint32_t FlagsMask = ~0U);
+diff --git a/FEXCore/include/FEXCore/HLE/SyscallHandler.h b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+index bf0cf6d..2df6355 100644
+--- a/FEXCore/include/FEXCore/HLE/SyscallHandler.h
++++ b/FEXCore/include/FEXCore/HLE/SyscallHandler.h
+@@ -21,6 +21,9 @@ struct ExecutableRangeInfo {
+   uint64_t Base;
+   uint64_t Size;
+   bool Writable;
++  // True when the guest has the address mapped (but not executable); false when it is unmapped in the guest view.
++  // Defaults true: only the Linux VMA query distinguishes unmapped from mapped-noexec.
++  bool Mapped {true};
+ };
+ 
+ class SyscallHandler;
+diff --git a/Source/Tools/CommonTools/DummyHandlers.h b/Source/Tools/CommonTools/DummyHandlers.h
+index 3de15eb..d9d4867 100644
+--- a/Source/Tools/CommonTools/DummyHandlers.h
++++ b/Source/Tools/CommonTools/DummyHandlers.h
+@@ -21,7 +21,7 @@ public:
+   }
+ 
+   FEXCore::HLE::ExecutableRangeInfo QueryGuestExecutableRange(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) override {
+-    return {0, UINT64_MAX, true};
++    return {0, UINT64_MAX, true, true};
+   }
+ };
+ 
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+index dbbf279..3166199 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SyscallsSMCTracking.cpp
+@@ -302,11 +302,16 @@ FEXCore::HLE::ExecutableRangeInfo SyscallHandler::QueryGuestExecutableRange(FEXC
+   auto ThreadObject = FEX::HLE::ThreadManager::GetStateObjectFromFEXCoreThread(Thread);
+ 
+   auto Entry = VMATracking.FindVMAEntry(Address);
+-  if (Entry == VMATracking.VMAs.end() ||
++  if (Entry != VMATracking.VMAs.end() &&
+       (!Entry->second.Prot.Executable && (!(ThreadObject->persona & READ_IMPLIES_EXEC) || !Entry->second.Prot.Readable))) {
+-    return {0, 0, false};
++    // Mapped in the guest view but not executable: a protection fault on fetch.
++    return {0, 0, false, true};
+   }
+-  return {Entry->first, Entry->second.Length, Entry->second.Prot.Writable};
++  if (Entry == VMATracking.VMAs.end()) {
++    // Not mapped in the guest view: a fetch fault on a missing page, not a protection fault.
++    return {0, 0, false, false};
++  }
++  return {Entry->first, Entry->second.Length, Entry->second.Prot.Writable, true};
+ }
+ 
+ struct ReadELFHeadersResult {
+-- 
+2.44.0
+
+
+From 9b618d2e1feb12f2461481c781a4d970735b4e2f Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 00:18:51 +0300
+Subject: [PATCH 3/8] ArchHelpers: set PF_USER on every guest page fault
+
+GetProtectFlags (arm64) gated X86_PF_USER on the ESR data-abort walk-level
+field being EL0 (0b11). That field records which page-table level resolved
+the abort, not which exception level the access came from; guest accesses
+always fault at EL0. Faults that resolved at walk level 0-2 (first delivery
+of a fault in a large unmapped gap) therefore lost PF_USER and the guest saw
+err=0x0 instead of the native 0x4/0x6/0x14/0x15 (PF_USER is bit 2, set by the
+kernel on every user-mode page fault). PF_USER is now unconditional; the
+walk-level constants are left for GetESRName only.
+
+Verified with tests/alt-nested (check 1 err 0x0 -> 0x4, matching the native
+oracle) and tests/segv-regs case 5 (MAPERR / err 0x14). Fault path only; zero
+cost when no fault is delivered.
+
+The second change this patch originally carried -- ForceGuestSigSegv
+unblocking SIGSEGV before raising it -- duplicated the audit fix to patch
+0019, where that code was introduced. That fix is in the series now, so this
+patch is reduced to the GetProtectFlags change and rebased onto it.
+
+Base: FEX-2610 14c92681 + patches 0001-0027.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ Source/Tools/LinuxEmulation/ArchHelpers/MContext.h | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/Source/Tools/LinuxEmulation/ArchHelpers/MContext.h b/Source/Tools/LinuxEmulation/ArchHelpers/MContext.h
+index fb6ab8c..aaa11c1 100644
+--- a/Source/Tools/LinuxEmulation/ArchHelpers/MContext.h
++++ b/Source/Tools/LinuxEmulation/ArchHelpers/MContext.h
+@@ -232,10 +232,13 @@ static inline uint32_t GetProtectFlags(void* ucontext) {
+                      ESR1_EC_DataAbort, GetESRName(ESR));
+ 
+   uint32_t ProtectFlags {};
+-  if ((ESR & ESR1_DataAbort_Level) == ESR1_DataAbort_Level_EL0) {
+-    // Always a user error for us.
+-    ProtectFlags |= FEXCore::X86State::X86_PF_USER;
+-  }
++
++  // A guest code memory access always faults at EL0, so PF_USER is always set: the kernel sets it for every
++  // user-mode page fault (bit 2 of the x86 error code, present in every reported value: 0x4 read, 0x6 write,
++  // 0x14/0x15 instruction fetch). The ESR walk-level field says which page-table level resolved, not which
++  // exception level the access came from, so it must not gate PF_USER: faults resolving at walk level 0-2
++  // (e.g. a fetch from an address in an unmapped huge gap) lost PF_USER and reported err=0x0.
++  ProtectFlags |= FEXCore::X86State::X86_PF_USER;
+ 
+   if (ESR & ESR1_WNR) {
+     // Fault was due to a write
+-- 
+2.44.0
+
+
+From 5618cb05e156bdf23442f56fc669bcc992821bfd Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 04:30:32 +0300
+Subject: [PATCH 4/8] JIT: report an undecodable instruction as #UD (trapno 6,
+ ILL_ILLOPN)
+
+An instruction the frontend cannot decode (BlockStatus INVALID_INST / BAD_RELOCATION: encodings that are invalid in
+64-bit mode, bad LOCK use, ...) reached the guest as SIGILL with REG_TRAPNO 0 and si_code 0. On Linux x86-64 it is a
+#UD: SIGILL, si_code ILL_ILLOPN (2), REG_TRAPNO 6 (arch/x86/kernel/traps.c handle_invalid_op -> do_error_trap). UD2 and
+the unimplemented-instruction path (UnimplementedOp) in FEX already report 6/2; InvalidOp was the odd one out.
+
+Consumer: Wine's segv_handler (also installed for SIGILL) switches on REG_TRAPNO; an unknown value is logged as
+"Got unexpected trap 0" before the same EXCEPTION_ILLEGAL_INSTRUCTION is raised, so the NT exception is unchanged but the
+log reports a spurious error per such instruction (seen from an anti-tamper runtime's probes). A program's own SIGILL
+handler testing si_code or trapno saw the wrong values.
+
+Cost: none; two constants in the generated Break reason.
+
+tests/ud-regs (native x86-64 oracle): ud2, ud0, push es, pusha, daa, aam, LOCK on a register operand.
+
+Upstream FEX main has the same InvalidOp (TrapNumber 0, si_code 0), checked via GitHub raw.
+
+Base: FEX-2610 14c92681 + patches 0001-0026.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 9c3fdfa..613584b 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -5213,11 +5213,12 @@ void OpDispatchBuilder::PermissionRestrictedOp(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::InvalidOp(OpcodeArgs) {
++  // #UD as the Linux x86 trap path reports it: SIGILL, ILL_ILLOPN, trapno 6 (same as UnimplementedOp and UD2).
+   BreakOp(Op, FEXCore::IR::BreakDefinition {
+                 .ErrorRegister = 0,
+                 .Signal = SIGILL,
+-                .TrapNumber = 0,
+-                .si_code = 0,
++                .TrapNumber = X86State::X86_TRAPNO_UD,
++                .si_code = 2, ///< ILL_ILLOPN
+               });
+ }
+ 
+-- 
+2.44.0
+
+
+From 40a9803f0d920d3613a0e256b7ce970c5fb38d70 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:11:49 +0300
+Subject: [PATCH 5/8] JIT: validate the fetched bytes of an undecodable
+ instruction on SMC-checked pages
+
+An instruction the decoder rejects has InstSize 0. On a page that is checked for self-modifying code (every page with
+FEX_SMCCHECKS=full, and the hot pages patch 0002 leaves writable) the translator emitted a ValidateCode for it over zero
+bytes. The JIT never writes its CRC register for a zero-length check, so the comparison reported "code changed" on every
+execution; the block removed its own entry and re-translated, and the thread looped in translation forever (millions of
+"Invalid instruction in entry block" log lines, 100% CPU, the guest never sees the signal).
+
+Validating a fixed single byte instead is not enough: an instruction rewritten in place that shares that byte (the
+rejected `lldt ax`, 0F 00 D0, followed by `ltr ax`, 0F 00 D8, or `swapgs`, 0F 01 F8) passes the check and reuses the
+cached #UD block instead of raising its own #GP. The decoder now records how many leading bytes it actually fetched (read
+or peeked, never skipped or substituted) before rejecting the instruction, in DecodedInst::RejectedSize, and the core
+validates exactly those bytes. A rejection with nothing fetched is an instruction fetch fault, which does not depend on
+the contents, so no check is emitted for it (this also avoids reading an inaccessible byte at translation time).
+
+Reproduced without Wine: tests/invalid-ops phase 2 (one code page rewritten and executed repeatedly, the pattern of
+Wine's exception tests and of runtime code generators) hung at the first undecodable instruction after the page turned
+hot; with a one-byte check it no longer hangs but reports ltr/swapgs as #UD; phase 3 alternates the rejected and the
+valid encodings on one page. Native x86-64 Linux is the oracle (#GP, trapno 13, for ltr and swapgs).
+
+Consumer: any program that executes an undecodable instruction from a page it also modifies (Wine/Proton exception
+tests, runtime code generators); the symptom is a permanent hang, or the wrong exception class. Cost: one byte compare
+per fetched byte at decode time; the emitted check is the one already emitted for every instruction on such pages.
+
+Upstream: Core.cpp ValidateCode and Frontend.cpp DecodeInstruction on FEX main (checked 2026-10-11) are unchanged, so
+FEX_SMCCHECKS=full is affected there as well; patch 0002 is what makes the default configuration reach it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/Core.cpp             | 14 ++++++++++----
+ FEXCore/Source/Interface/Core/Frontend.cpp         |  6 ++++++
+ FEXCore/Source/Interface/Core/Frontend.h           |  3 +++
+ .../Source/Interface/Core/X86Tables/X86Tables.h    |  2 ++
+ 4 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Core.cpp b/FEXCore/Source/Interface/Core/Core.cpp
+index 1f2e7e4..a333986 100644
+--- a/FEXCore/Source/Interface/Core/Core.cpp
++++ b/FEXCore/Source/Interface/Core/Core.cpp
+@@ -652,15 +652,21 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
+           Thread->OpDispatcher->_GuestOpcode(InstAddress - GuestRIP);
+         }
+ 
+-        if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || SyscallHandler->IsSMCHotPage(InstAddress)) {
++        // An instruction the decoder rejected has InstSize 0; validate the bytes the decoder fetched before rejecting it
++        // instead. Validating zero bytes would report the code as changed on every execution (endless re-translation),
++        // and validating fewer bytes than the decoder looked at would let a rewritten instruction that shares them reuse
++        // this block. Nothing was fetched only for a fetch fault, which does not depend on the contents.
++        const uint8_t ValidateSize = DecodedInfo->InstSize ? DecodedInfo->InstSize : DecodedInfo->RejectedSize;
++        if (ValidateSize &&
++            (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection || SyscallHandler->IsSMCHotPage(InstAddress))) {
+           auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
+ 
+-          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, DecodedInfo->InstSize);
++          auto Value = FEXCore::Utils::crc32(ExistingCodePtr, ValidateSize);
+           auto CRC = WantsDiskCachePatching ?
+-                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, DecodedInfo->InstSize) :
++                       Thread->OpDispatcher->_PatchableGuestCRC(IR::OpSize::i64Bit, Value, (int64_t)ExistingCodePtr, ValidateSize) :
+                        Thread->OpDispatcher->Constant(Value);
+-          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, DecodedInfo->InstSize);
++          auto CodeChanged = Thread->OpDispatcher->_ValidateCode(CRC, InstAddressReg, ValidateSize);
+ 
+           auto InvalidateCodeCond = Thread->OpDispatcher->CondJump(CodeChanged);
+ 
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index ff9e28e..1e4eb77 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -137,6 +137,7 @@ uint8_t Decoder::ReadByte() {
+ std::optional<uint8_t> Decoder::PeekByte(uint8_t Offset) {
+   uint64_t ByteAddress = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize + Offset);
+   if (CheckRangeExecutable(ByteAddress, 1)) {
++    ExaminedSize = std::max<uint8_t>(ExaminedSize, InstructionSize + Offset + 1);
+     return InstStream.AdjustedInstStream[InstructionSize + Offset];
+   } else {
+     return std::nullopt;
+@@ -152,6 +153,7 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
+   LastFieldReadSize = Size;
+   if (CheckRangeExecutable(Address, Size)) {
+     std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
++    ExaminedSize = std::max<uint8_t>(ExaminedSize, InstructionSize + Size);
+   } else {
+     HitNonExecutableRange = true;
+     // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
+@@ -849,6 +851,7 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+ 
+ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+   InstructionSize = 0;
++  ExaminedSize = 0;
+   LastEscapePrefix = 0;
+   Instruction.fill(0);
+ 
+@@ -1094,6 +1097,9 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+     const auto InstSize = DecodeInst->InstSize;
+     DecodeInst->TableInfo = nullptr;
+     DecodeInst->InstSize = 0;
++    // The bytes that led to the rejection. The core validates these on SMC-checked pages, so that rewriting them
++    // into a different instruction re-translates instead of reusing this block.
++    DecodeInst->RejectedSize = std::min<uint8_t>(ExaminedSize, MAX_INST_SIZE);
+ 
+     // A decode error can be caused by substituting zero for an inaccessible
+     // instruction byte, so the instruction fetch fault takes priority.
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 322b8e7..1ba4979 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -187,6 +187,9 @@ private:
+ 
+   static constexpr size_t MAX_INST_SIZE = 15;
+   uint8_t InstructionSize {};
++  // Number of leading instruction bytes the decoder has successfully fetched (read or peeked) for the current
++  // instruction. Unlike InstructionSize it never counts bytes that were skipped or substituted.
++  uint8_t ExaminedSize {};
+   // Contains the full decoded instruction, unless it is a `Thunk` instruction.
+   std::array<uint8_t, MAX_INST_SIZE> Instruction;
+   uint8_t LastEscapePrefix {};
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index 3010516..d35b3ac 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -241,6 +241,8 @@ struct DecodedInst {
+   uint8_t SIB;
+   uint8_t InstSize;
+   int8_t REXIndex;
++  // For an instruction the decoder rejected (InstSize 0): how many leading bytes it fetched before rejecting it.
++  uint8_t RejectedSize;
+ };
+ 
+ union ModRMDecoded {
+-- 
+2.44.0
+
+
+From 18f972a49758691f0ff4015ecef044f798fde014 Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sat, 10 Oct 2026 10:11:49 +0300
+Subject: [PATCH 6/8] Signals: raise `int 3` (CD 03) as #BP and `int 4` as #OF,
+ like Linux
+
+INT imm8 reported every vector except 0x80 as a #GP with the vector in the error code. On x86-64 Linux the gates for
+vectors 3 and 4 are user-callable: CD 03 is a #BP exactly like the one-byte INT3 (SIGTRAP, si_code SI_KERNEL, trapno 3,
+RIP after the instruction) and CD 04 is #OF (SIGSEGV, si_code SI_KERNEL, trapno 4, RIP after the instruction). The other
+vectors already matched (CD 00, 01, 21, 2d: SIGSEGV, trapno 13, error code vector<<3|2).
+
+Consumer: Wine maps trapno 3 to EXCEPTION_BREAKPOINT and trapno 4 to EXCEPTION_INT_OVERFLOW; a Windows program that
+uses the two-byte int 3 saw EXCEPTION_ACCESS_VIOLATION instead. Cost: none; chosen when the instruction is translated.
+
+tests/invalid-ops (native x86-64 oracle): int3-cd03, int4-cd04.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 613584b..f4f2a66 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -4878,6 +4878,17 @@ void OpDispatchBuilder::INTOp(OpcodeArgs) {
+       }
+     }
+ 
++    // Vectors 3 and 4 have user-callable gates on Linux: `int 3` (CD 03) is a #BP exactly like INT3, and `int 4` is #OF.
++    // Both report the address after the instruction. Every other vector is a #GP with the vector in the error code.
++    if (Literal == 3 || Literal == 4) {
++      Reason.ErrorRegister = 0;
++      Reason.Signal = Literal == 3 ? Core::FAULT_SIGTRAP : Core::FAULT_SIGSEGV;
++      Reason.TrapNumber = Literal == 3 ? X86State::X86_TRAPNO_BP : X86State::X86_TRAPNO_OF;
++      Reason.si_code = 0x80;
++      SetRIPToNext = true;
++      break;
++    }
++
+     Reason.ErrorRegister = Literal << 3 | (0b010);
+     Reason.Signal = Core::FAULT_SIGSEGV;
+     // GP is raised when task-gate isn't setup to be valid
+-- 
+2.44.0
+
+
+From 9e8e99fb655719188a6e4d3bbee11c9c3764583d Mon Sep 17 00:00:00 2001
+From: StonkGuy <68372320+StonkGuy@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 14:00:00 +0300
+Subject: [PATCH 7/8] JIT: report the page boundary as si_addr for an
+ instruction fetch that straddles into a non-executable page
+
+When an instruction starts on an executable page and its remaining bytes lie on a page without execute
+permission, x86 raises #PF for the first byte it cannot fetch: CR2, and so the SIGSEGV si_addr the kernel
+reports (arch/x86/mm/fault.c, force_sig_fault(SIGSEGV, si_code, address)), is the start of the second page,
+while RIP stays at the instruction start. FEX raised the fetch fault through NoExecOp, whose generated
+SIGSEGV always used the instruction start (OriginalRIP) as si_addr, so the guest was told the wrong page.
+
+Consumer: Wine turns the signal into EXCEPTION_ACCESS_VIOLATION with ExceptionInformation[0] = 8 (execute)
+and ExceptionInformation[1] = si_addr (dlls/ntdll/unix/signal_x86_64.c, segv_handler). A handler that
+makes the page at ExceptionInformation[1] executable (lazily committed or protected code pages) and
+continues fixes the page that is already executable; the same fault repeats forever.
+
+The decoder already knows the address: CheckRangeExecutable walks executable ranges and stops on the
+first byte no range covers. That address is kept for the instruction being decoded, turned into an
+offset from the instruction start (ranges are page granular, so it is the faulting page's base) and
+carried in the Break definition (FaultAddressOffset, one byte taken from the padding of
+SynchronousFaultData). The signal frame builder adds it to OriginalRIP. Every other generated fault
+keeps offset 0 and is unchanged; the cost is one byte in a constant that is already stored on the fault
+path, nothing on the translation or execution path of valid code.
+
+Test: tests/segv-regs case 7 (mov $imm32 two bytes before the end of an r-x page, next page rw-):
+expected (kernel source) si_addr = page boundary, RIP = instruction start; FEX before this change gives
+si_addr = RIP (source reading). Case 8 (run a page, drop PROT_EXEC, run it again) guards the invalidation
+side; GuestMprotect invalidates the range, so it is expected to pass before and after.
+NOT YET COMPILED OR RUN: native and FEX results pending.
+
+Upstream FEX main has the same NoExecOp and the same OriginalRIP si_addr (checked in the pinned tree;
+re-check main before carrying this). The Windows frontends (Source/Windows/Common/Exception.h) build
+their own EXCEPTION_RECORD and are not changed here.
+
+Base: FEX-2610 14c92681 + patches 0001-0026, 0030-0032 (applies independently of 0027-0029 and 0033;
+with 0027, UnmappedOp should carry the same offset).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/Frontend.cpp             | 10 ++++++++++
+ FEXCore/Source/Interface/Core/Frontend.h               |  2 ++
+ FEXCore/Source/Interface/Core/JIT/MiscOps.cpp          |  1 +
+ FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp     |  2 ++
+ FEXCore/Source/Interface/Core/X86Tables/X86Tables.h    |  2 ++
+ FEXCore/Source/Interface/IR/IR.json                    |  1 +
+ FEXCore/Source/Interface/IR/IRDumper.cpp               |  3 ++-
+ FEXCore/include/FEXCore/Core/CoreState.h               |  3 ++-
+ .../SignalDelegator/GuestFramesManagement.cpp          |  2 +-
+ 9 files changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/Frontend.cpp b/FEXCore/Source/Interface/Core/Frontend.cpp
+index 1e4eb77..ac50082 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.cpp
++++ b/FEXCore/Source/Interface/Core/Frontend.cpp
+@@ -107,6 +107,7 @@ bool Decoder::CheckRangeExecutable(uint64_t Address, uint64_t Size) {
+     ExecutableRangeWritable = RangeInfo.Writable;
+ 
+     if (RangeInfo.Size == 0) {
++      NonExecutableFetchAddress = Address;
+       HitUnmappedFetch = !RangeInfo.Mapped;
+       return false;
+     }
+@@ -852,6 +853,7 @@ Decoder::DecodedBlockStatus Decoder::NormalOpHeader(const FEXCore::X86Tables::X8
+ Decoder::DecodedBlockStatus Decoder::DecodeInstructionImpl(uint64_t PC) {
+   InstructionSize = 0;
+   ExaminedSize = 0;
++  NonExecutableFetchAddress = 0;
+   LastEscapePrefix = 0;
+   Instruction.fill(0);
+ 
+@@ -1104,6 +1106,14 @@ Decoder::DecodedBlockStatus Decoder::DecodeInstruction(uint64_t PC) {
+     // A decode error can be caused by substituting zero for an inaccessible
+     // instruction byte, so the instruction fetch fault takes priority.
+     if (HitNonExecutableRange) {
++      // Native reports the first byte that could not be fetched, which is past the instruction start when the
++      // instruction straddles into a non-executable page.
++      // Executable ranges are page granular, so that byte is the start of the page holding the failed read.
++      const auto InstStart = reinterpret_cast<uint64_t>(InstStream.InstStream);
++      const auto FaultPage = NonExecutableFetchAddress & ~static_cast<uint64_t>(FEXCore::Utils::FEX_PAGE_SIZE - 1);
++      if (NonExecutableFetchAddress && FaultPage > InstStart && FaultPage - InstStart < MAX_INST_SIZE) {
++        DecodeInst->FetchFaultOffset = FaultPage - InstStart;
++      }
+       if (InstSize) {
+         return DecodedBlockStatus::PARTIAL_DECODE_INST;
+       }
+diff --git a/FEXCore/Source/Interface/Core/Frontend.h b/FEXCore/Source/Interface/Core/Frontend.h
+index 1ba4979..bd4b6af 100644
+--- a/FEXCore/Source/Interface/Core/Frontend.h
++++ b/FEXCore/Source/Interface/Core/Frontend.h
+@@ -154,6 +154,8 @@ private:
+   uint64_t ExecutableRangeBase {};
+   uint64_t ExecutableRangeEnd {};
+   bool ExecutableRangeWritable {};
++  // First guest address the current instruction's fetch could not read (0 if none): the x86 CR2 of a fetch fault.
++  uint64_t NonExecutableFetchAddress {};
+   bool HitNonExecutableRange {};
+   // True when the last failing executable-range query reported the address as unmapped in the guest view
+   // (no VMA), rather than mapped without execute permission.
+diff --git a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+index 6e8df95..d3fcf5d 100644
+--- a/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
++++ b/FEXCore/Source/Interface/Core/JIT/MiscOps.cpp
+@@ -68,6 +68,7 @@ DEF_OP(Break) {
+     .TrapNo = Op->Reason.TrapNumber,
+     .si_code = Op->Reason.si_code,
+     .err_code = Op->Reason.ErrorRegister,
++    .FaultAddressOffset = Op->Reason.FaultAddressOffset,
+   };
+ 
+   uint64_t Constant {};
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index f4f2a66..39d0852 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -5239,6 +5239,7 @@ void OpDispatchBuilder::NoExecOp(OpcodeArgs) {
+                 .Signal = Core::FAULT_SIGSEGV,
+                 .TrapNumber = X86State::X86_TRAPNO_PF,
+                 .si_code = 2, // SEGV_ACCERR
++                .FaultAddressOffset = Op->FetchFaultOffset,
+               });
+ }
+ 
+@@ -5250,6 +5251,7 @@ void OpDispatchBuilder::UnmappedOp(OpcodeArgs) {
+                 .Signal = Core::FAULT_SIGSEGV,
+                 .TrapNumber = X86State::X86_TRAPNO_PF,
+                 .si_code = 1, // SEGV_MAPERR
++                .FaultAddressOffset = Op->FetchFaultOffset,
+               });
+ }
+ 
+diff --git a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+index d35b3ac..d3826d6 100644
+--- a/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
++++ b/FEXCore/Source/Interface/Core/X86Tables/X86Tables.h
+@@ -243,6 +243,8 @@ struct DecodedInst {
+   int8_t REXIndex;
+   // For an instruction the decoder rejected (InstSize 0): how many leading bytes it fetched before rejecting it.
+   uint8_t RejectedSize;
++  // For an instruction whose fetch hit a non-executable page: offset of the first unreadable byte from the start.
++  uint8_t FetchFaultOffset;
+ };
+ 
+ union ModRMDecoded {
+diff --git a/FEXCore/Source/Interface/IR/IR.json b/FEXCore/Source/Interface/IR/IR.json
+index 8805200..c7ee72c 100644
+--- a/FEXCore/Source/Interface/IR/IR.json
++++ b/FEXCore/Source/Interface/IR/IR.json
+@@ -124,6 +124,7 @@
+     "  uint8_t Signal;",
+     "  uint8_t TrapNumber;",
+     "  uint8_t si_code;",
++    "  uint8_t FaultAddressOffset; ///< si_addr = RIP + this, for a generated fault",
+     "};"
+   ],
+   "IRTypes" : {
+diff --git a/FEXCore/Source/Interface/IR/IRDumper.cpp b/FEXCore/Source/Interface/IR/IRDumper.cpp
+index 31ecddc..f7119a6 100644
+--- a/FEXCore/Source/Interface/IR/IRDumper.cpp
++++ b/FEXCore/Source/Interface/IR/IRDumper.cpp
+@@ -323,7 +323,8 @@ static void PrintArg(fextl::ostringstream* out, const IRListView*, FEXCore::IR::
+   *out << "{" << Arg.ErrorRegister << ".";
+   *out << static_cast<uint32_t>(Arg.Signal) << ".";
+   *out << static_cast<uint32_t>(Arg.TrapNumber) << ".";
+-  *out << static_cast<uint32_t>(Arg.si_code) << "}";
++  *out << static_cast<uint32_t>(Arg.si_code) << ".";
++  *out << static_cast<uint32_t>(Arg.FaultAddressOffset) << "}";
+ }
+ 
+ static void PrintArg(fextl::ostringstream* out, const IRListView*, ShiftType Arg) {
+diff --git a/FEXCore/include/FEXCore/Core/CoreState.h b/FEXCore/include/FEXCore/Core/CoreState.h
+index ea9ed22..bc4a7ac 100644
+--- a/FEXCore/include/FEXCore/Core/CoreState.h
++++ b/FEXCore/include/FEXCore/Core/CoreState.h
+@@ -443,7 +443,8 @@ struct CpuStateFrame {
+     uint8_t TrapNo;
+     uint8_t si_code;
+     uint16_t err_code;
+-    uint16_t _pad : 16;
++    uint8_t FaultAddressOffset;
++    uint8_t _pad : 8;
+   } SynchronousFaultData;
+ 
+   InternalThreadState* Thread;
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+index 4c91eb2..767141a 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator/GuestFramesManagement.cpp
+@@ -564,7 +564,7 @@ uint64_t SignalDelegator::SetupFrame_x64(FEXCore::Core::InternalThreadState* Thr
+ 
+     // Overwrite si_code and si_addr
+     guest_siginfo->si_code = Thread->CurrentFrame->SynchronousFaultData.si_code;
+-    guest_siginfo->si_addr = reinterpret_cast<void*>(ContextBackup->OriginalRIP);
++    guest_siginfo->si_addr = reinterpret_cast<void*>(ContextBackup->OriginalRIP + Frame->SynchronousFaultData.FaultAddressOffset);
+     Signal = Frame->SynchronousFaultData.Signal;
+   } else {
+     guest_uctx->uc_mcontext.gregs[FEXCore::x86_64::FEX_REG_TRAPNO] = ConvertSignalToTrapNo(Signal, HostSigInfo);
+-- 
+2.44.0
+
+
+From e98364e74493bf549e34ed5644e89c8c1d16e672 Mon Sep 17 00:00:00 2001
+From: aqua <cps@Aquas-MacBook-Air.local>
+Date: Sat, 17 Oct 2026 07:26:52 +0300
+Subject: [PATCH 8/8] OpcodeDispatcher: raise #DE for DIV/IDIV with a zero
+ divisor or an overflowing quotient
+
+What x86-64 Linux does: DIV and IDIV raise #DE when the divisor is zero and when the quotient does not fit the
+destination (DIV: upper half of the dividend >= divisor; IDIV: e.g. INT_MIN / -1, or a 128-bit dividend whose
+quotient needs more than 64 bits). The kernel delivers it as SIGFPE with si_code FPE_INTDIV and trapno 0 at the
+divide instruction, registers unchanged (arch/x86/kernel/traps.c exc_divide_error); Wine turns it into
+EXCEPTION_INT_DIVIDE_BY_ZERO for structured exception handlers.
+
+What FEX did: Arm64 divides never trap, so a zero divisor gave a zero quotient, an overflowing one was truncated,
+and execution carried on. Upstream lists this as a known failure (FEX-Emu/FEX#1980, closed in favour of the
+Known_Failures lists); FEX main still has no #DE. Who observes it: any program whose control flow goes through the
+exception, typically SEH-based code that divides by a computed zero on purpose (obfuscated control flow, self
+checks), plus the exception record a debugger-aware runtime inspects. Found by eac-tests/insn-diff, the
+differential instruction test against a native x86-64 oracle: 1263 of 2400 random DIV/IDIV inputs faulted natively
+and none did under FEX.
+
+Fix: the frontend branches to a block that raises SIGFPE/FPE_INTDIV/#DE at the divide. All checks use plain ALU
+ops and cbz/cbnz/tbz (the guest NZCV is never touched) and every IR value stays inside its block:
+  DIV: before the divide, tbz on the borrow of RDX - divisor (unsigned; AH for 8-bit): #DE unless RDX < divisor,
+  which also covers a zero divisor. The operands are re-read after the branch (free for registers, which live in
+  host registers; a memory divisor is read a second time).
+  IDIV: before the divide, cbz on the divisor. Then, when the dividend is the sign extension of its low half (what
+  CBW/CWD/CDQ/CQO produce, i.e. almost all compiled code), the only overflow is MIN / -1, checked from the inputs
+  with a cbz that is off the critical path of the result. Any other dividend takes a slow path that checks the
+  quotient itself: 8/16/32-bit divides are exact in the wider precision FEX already uses, so the quotient must
+  sign-extend from the operand size; for 64-bit the 128/64 divide truncates, so Quotient * Divisor + Remainder must
+  equal RDX:RAX (high halves compared). There RAX/RDX are blended with their old values under the resulting
+  all-ones mask, so a faulting divide leaves them unchanged, and one cbnz at the end takes the fault.
+DiskCache FormatVersion 30 -> 31 and the InstCountCI DIV/IDIV entries updated (generated code changes; the
+pre-existing popf/pop ss count differences on this branch are left alone).
+
+Cost, measured on Neoverse N2 (GitHub ubuntu-24.04-arm, eac-tests/insn-diff CI divbench, 50M dependent divides):
+div32 4.33 -> 4.30 ns, div64 6.07 -> 5.96 ns, idiv32 4.88 -> 4.99 ns, idiv64 6.02 -> 6.34 ns. Nothing outside
+DIV/IDIV changes.
+
+The Linux frontend
+delivers the break (which leaves the JIT through the SIGTRAP trampoline) with the guest's SIGFPE disposition; the
+Windows frontend maps it to EXCEPTION_INT_DIVIDE_BY_ZERO like Wine does on Linux.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ FEXCore/Source/Interface/Core/DiskCache.h     |   2 +-
+ .../Interface/Core/OpcodeDispatcher.cpp       | 186 ++++++++--
+ .../Source/Interface/Core/OpcodeDispatcher.h  |   1 +
+ .../include/FEXCore/Core/SignalDelegator.h    |   2 +
+ .../LinuxSyscalls/SignalDelegator.cpp         |   8 +
+ Source/Windows/Common/Exception.h             |   8 +
+ unittests/InstructionCountCI/AFP/H0F3A.json   |   2 +-
+ .../AFP/SVE256/Secondary.json                 |   2 +-
+ .../AFP/SVE256/Secondary_REP.json             |   2 +-
+ .../AFP/SVE256/Secondary_REPNE.json           |   2 +-
+ .../InstructionCountCI/AFP/Secondary.json     |   2 +-
+ .../InstructionCountCI/AFP/Secondary_REP.json |   2 +-
+ .../AFP/Secondary_REPNE.json                  |   2 +-
+ .../InstructionCountCI/AFP/VEX_map1.json      |   2 +-
+ .../InstructionCountCI/AFP/VEX_map3.json      |   2 +-
+ unittests/InstructionCountCI/AVX128/FMA4.json |   2 +-
+ .../InstructionCountCI/AVX128/VEX_map1.json   |   2 +-
+ .../AVX128/VEX_map1_FCMA.json                 |   2 +-
+ .../AVX128/VEX_map1_SVE128.json               |   2 +-
+ .../AVX128/VEX_map1_flagm.json                |   2 +-
+ .../InstructionCountCI/AVX128/VEX_map2.json   |   2 +-
+ .../AVX128/VEX_map2_AFP.json                  |   2 +-
+ .../AVX128/VEX_map2_DOTPROD.json              |   2 +-
+ .../AVX128/VEX_map2_I8MM.json                 |   2 +-
+ .../AVX128/VEX_map2_SVE128.json               |   2 +-
+ .../AVX128/VEX_map2_flagm.json                |   2 +-
+ .../InstructionCountCI/AVX128/VEX_map3.json   |   2 +-
+ .../AVX128/VEX_map3_SVE128.json               |   2 +-
+ .../AVX128/VEX_map_group.json                 |   2 +-
+ unittests/InstructionCountCI/Atomics.json     |   2 +-
+ .../InstructionCountCI/Crypto/H0F38.json      |   2 +-
+ .../Crypto/H0F38_SVE128.json                  |   2 +-
+ .../InstructionCountCI/Crypto/H0F3A.json      |   2 +-
+ unittests/InstructionCountCI/DDD.json         |   2 +-
+ .../FEXOpt/AddressingLimitations.json         |   2 +-
+ .../FEXOpt/AddressingLimitations_32Bit.json   |   2 +-
+ .../InstructionCountCI/FEXOpt/MultiInst.json  | 239 ++++++++++++-
+ .../FEXOpt/MultiInst_32bit.json               |   2 +-
+ .../FEXOpt/MultiInst_AFP.json                 |   2 +-
+ .../FEXOpt/MultiInst_TSO.json                 |   2 +-
+ .../FEXOpt/MultiInst_TSO_32bit.json           |   2 +-
+ .../InstructionCountCI/FEXOpt/Peephole.json   |   2 +-
+ .../FEXOpt/Peephole_SVE128.json               |   2 +-
+ .../InstructionCountCI/FEXOpt/libnss.json     |   2 +-
+ .../InstructionCountCI/FlagM/Atomics.json     |   2 +-
+ .../InstructionCountCI/FlagM/FlagOpts.json    |   2 +-
+ unittests/InstructionCountCI/FlagM/H0F38.json |   2 +-
+ .../InstructionCountCI/FlagM/HotBlocks.json   |   2 +-
+ .../FlagM/HotBlocks_32Bit.json                |   2 +-
+ .../FlagM/HotBlocks_AFP.json                  |   2 +-
+ .../FlagM/HotBlocks_TSO_32Bit.json            |   2 +-
+ .../InstructionCountCI/FlagM/Primary.json     |   2 +-
+ .../FlagM/PrimaryGroup.json                   |  88 ++++-
+ .../FlagM/Primary_32Bit.json                  |   2 +-
+ .../InstructionCountCI/FlagM/Secondary.json   |   2 +-
+ .../FlagM/SecondaryGroup.json                 |   2 +-
+ .../FlagM/SecondaryModRM.json                 |   2 +-
+ .../FlagM/Secondary_OpSize.json               |   2 +-
+ .../FlagM/Secondary_REP.json                  |   2 +-
+ .../FlagM/Secondary_REP_CSSC.json             |   2 +-
+ .../InstructionCountCI/FlagM/VEX_map1.json    |   2 +-
+ .../InstructionCountCI/FlagM/VEX_map2.json    |   2 +-
+ .../FlagM/VEX_map_group.json                  |   2 +-
+ .../FlagM/x87-Crysis2Max-fmodel.json          |   2 +-
+ .../FlagM/x87-HalfLife.json                   |   2 +-
+ .../FlagM/x87-Oblivion.json                   |   2 +-
+ .../FlagM/x87-Psychonauts.json                |   2 +-
+ unittests/InstructionCountCI/FlagM/x87.json   |   2 +-
+ .../FlagM/x87_f64-Crysis2Max-fmodel.json      |   2 +-
+ .../FlagM/x87_f64-HalfLife.json               |   2 +-
+ .../FlagM/x87_f64-Oblivion.json               |   2 +-
+ .../FlagM/x87_f64-Psychonauts.json            |   2 +-
+ .../InstructionCountCI/FlagM/x87_f64.json     |   2 +-
+ unittests/InstructionCountCI/H0F38.json       |   2 +-
+ unittests/InstructionCountCI/H0F3A.json       |   2 +-
+ .../InstructionCountCI/H0F3A_SVE128.json      |   2 +-
+ .../InstructionCountCI/MOPS/Primary.json      |   2 +-
+ unittests/InstructionCountCI/Primary.json     |   2 +-
+ .../InstructionCountCI/PrimaryGroup.json      | 321 +++++++++++++++++-
+ .../InstructionCountCI/Primary_32Bit.json     |   2 +-
+ unittests/InstructionCountCI/RPRES/DDD.json   |   2 +-
+ .../InstructionCountCI/RPRES/Secondary.json   |   2 +-
+ .../RPRES/Secondary_REP_AFP.json              |   2 +-
+ .../RPRES/VEX_map1_AFP.json                   |   2 +-
+ unittests/InstructionCountCI/Repeat.json      |   2 +-
+ .../InstructionCountCI/SSE42_Strings.json     |   2 +-
+ unittests/InstructionCountCI/Secondary.json   |   2 +-
+ .../InstructionCountCI/SecondaryGroup.json    |   2 +-
+ .../InstructionCountCI/SecondaryModRM.json    |   2 +-
+ .../InstructionCountCI/Secondary_32Bit.json   |   2 +-
+ .../InstructionCountCI/Secondary_OpSize.json  |   2 +-
+ .../Secondary_OpSize_FCMA.json                |   2 +-
+ .../Secondary_OpSize_SVE128.json              |   2 +-
+ .../Secondary_OpSize_SVE256.json              |   2 +-
+ .../InstructionCountCI/Secondary_REP.json     |   2 +-
+ .../InstructionCountCI/Secondary_REPNE.json   |   2 +-
+ .../Secondary_REPNE_FCMA.json                 |   2 +-
+ .../Secondary_REPNE_SVE128.json               |   2 +-
+ .../Secondary_REP_FRINTTS.json                |   2 +-
+ .../InstructionCountCI/Secondary_SVE128.json  |   2 +-
+ unittests/InstructionCountCI/VEX_map1.json    |   2 +-
+ .../InstructionCountCI/VEX_map1_FCMA.json     |   2 +-
+ .../InstructionCountCI/VEX_map1_FRINTTS.json  |   2 +-
+ unittests/InstructionCountCI/VEX_map2.json    |   2 +-
+ .../InstructionCountCI/VEX_map2_DOTPROD.json  |   2 +-
+ .../InstructionCountCI/VEX_map2_I8MM.json     |   2 +-
+ .../VEX_map2_svebitperm.json                  |   2 +-
+ unittests/InstructionCountCI/VEX_map3.json    |   2 +-
+ .../InstructionCountCI/VEX_map_group.json     |   2 +-
+ unittests/InstructionCountCI/X87ldst-SVE.json |   2 +-
+ unittests/InstructionCountCI/x87.json         |   2 +-
+ unittests/InstructionCountCI/x87_32Bit.json   |   2 +-
+ unittests/InstructionCountCI/x87_f64.json     |   2 +-
+ .../InstructionCountCI/x87_f64_32Bit.json     |   2 +-
+ 114 files changed, 905 insertions(+), 160 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/DiskCache.h b/FEXCore/Source/Interface/Core/DiskCache.h
+index ab0264d..0b43365 100644
+--- a/FEXCore/Source/Interface/Core/DiskCache.h
++++ b/FEXCore/Source/Interface/Core/DiskCache.h
+@@ -249,7 +249,7 @@ namespace DiskCache {
+   // The current version of the diskcache.
+   // This must be changed any time codegen changes occur!
+   // Be aware of the impact of changing this frequently!
+-  static constexpr uint16_t FormatVersion = 30;
++  static constexpr uint16_t FormatVersion = 31;
+ 
+   static constexpr uint32_t LOOKUP_KEY_MAX_BUCKET_DEPTH = 500;
+ 
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+index 39d0852..14eedb7 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.cpp
+@@ -3748,19 +3748,73 @@ void OpDispatchBuilder::NEGOp(OpcodeArgs) {
+   }
+ }
+ 
++// #DE, integer divide error. x86 raises it for a zero divisor and for a quotient that does not fit the destination;
++// Linux delivers both as SIGFPE with si_code FPE_INTDIV (arch/x86/kernel/traps.c, exc_divide_error) at the divide, with
++// the registers unchanged. Arm64 divides never trap, so the frontend branches to a faulting block instead. The checks use
++// plain ALU ops and cbz/cbnz/tbz only, so the guest NZCV is never touched.
++//
++// IR values must not cross blocks, so a check that runs before the divide re-reads its operands afterwards (free for
++// registers, which live in host registers; a memory divisor is read a second time). An IDIV quotient overflow is only
++// known after the divide: there the new RAX/RDX are blended with the old values under an all-ones fault mask, so a
++// faulting divide leaves them unchanged, and the branch comes last.
++void OpDispatchBuilder::DivideErrorIf(OpcodeArgs, Ref Src, CondClass Cond, unsigned Bit) {
++  auto FaultBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++  auto ContinueBlock = CreateNewCodeBlockAfter(FaultBlock);
++
++  if (Cond == CondClass::TSTZ || Cond == CondClass::TSTNZ) {
++    auto Jump = CondJumpBit(Src, Bit, Cond == CondClass::TSTNZ);
++    SetTrueJumpTarget(Jump, FaultBlock);
++    SetFalseJumpTarget(Jump, ContinueBlock);
++  } else {
++    CondJump(Src, FaultBlock, ContinueBlock, Cond);
++  }
++
++  SetCurrentCodeBlock(FaultBlock);
++  StartNewBlock();
++  // #DE is a fault: RIP points at the divide instruction itself.
++  _StoreContextGPR(GetGPROpSize(), GetRelocatedPC(Op, -Op->InstSize), offsetof(FEXCore::Core::CPUState, rip));
++  Break(FEXCore::IR::BreakDefinition {
++    .ErrorRegister = 0,
++    .Signal = Core::FAULT_SIGFPE,
++    .TrapNumber = X86State::X86_TRAPNO_DE,
++    .si_code = 1, ///< FPE_INTDIV
++  });
++
++  SetCurrentCodeBlock(ContinueBlock);
++  StartNewBlock();
++}
++
+ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+   const auto GPRSize = GetGPROpSize();
+   auto Size = OpSizeFromSrc(Op);
+ 
+-  // This loads the divisor. 32-bit/64-bit paths mask inside the JIT, 8/16 do not.
+-  Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = Size >= OpSize::i32Bit});
+-
+   if (Size == OpSize::i64Bit && !Is64BitMode) {
+     LogMan::Msg::EFmt("Doesn't exist in 32bit mode");
+     DecodeFailure = true;
+     return;
+   }
+ 
++  {
++    // #DE unless the upper half of the dividend is below the divisor; this also covers a zero divisor.
++    Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = true});
++    if (Size == OpSize::i64Bit) {
++      // Borrow out of RDX - Divisor without NZCV: its sign bit is set exactly when RDX < Divisor.
++      Ref High = LoadGPRRegister(X86State::REG_RDX);
++      Ref Diff = _Sub(OpSize::i64Bit, High, Divisor);
++      Ref Borrow = _Or(OpSize::i64Bit, _Andn(OpSize::i64Bit, Divisor, High), _Andn(OpSize::i64Bit, Diff, _Xor(OpSize::i64Bit, High, Divisor)));
++      DivideErrorIf(Op, Borrow, CondClass::TSTZ, 63);
++    } else {
++      // Zero-extended to 64 bits, High - Divisor is negative exactly when High < Divisor.
++      const auto Bits = IR::OpSizeAsBits(Size);
++      Ref High = Size == OpSize::i8Bit ? _Bfe(OpSize::i64Bit, 8, 8, LoadGPRRegister(X86State::REG_RAX)) :
++                                         _Bfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RDX));
++      DivideErrorIf(Op, _Sub(OpSize::i64Bit, High, _Bfe(OpSize::i64Bit, Bits, 0, Divisor)), CondClass::TSTZ, 63);
++    }
++  }
++
++  // This loads the divisor. 32-bit/64-bit paths mask inside the JIT, 8/16 do not.
++  Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags, {.AllowUpperGarbage = Size >= OpSize::i32Bit});
++
+   Ref Quotient = _AllocateGPR(true);
+   Ref Remainder = _AllocateGPR(true);
+ 
+@@ -3790,11 +3844,8 @@ void OpDispatchBuilder::DIVOp(OpcodeArgs) {
+ }
+ 
+ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+-  // This loads the divisor
+-  Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags);
+-
+   const auto GPRSize = GetGPROpSize();
+-  auto Size = OpSizeFromSrc(Op);
++  const auto Size = OpSizeFromSrc(Op);
+ 
+   if (Size == OpSize::i64Bit && !Is64BitMode) {
+     LogMan::Msg::EFmt("Doesn't exist in 32bit mode");
+@@ -3802,34 +3853,117 @@ void OpDispatchBuilder::IDIVOp(OpcodeArgs) {
+     return;
+   }
+ 
+-  Ref Quotient = _AllocateGPR(true);
+-  Ref Remainder = _AllocateGPR(true);
++  // #DE for a zero divisor. Checked before the divide, so the 128-bit divide helper never sees one.
++  DivideErrorIf(Op, LoadSourceGPR(Op, Op->Dest, Op->Flags), CondClass::EQ);
+ 
++  // #DE when the quotient does not fit the operand size. Compiled code almost always divides a dividend that is the
++  // sign extension of its low half (CBW/CWD/CDQ/CQO); then the only overflow is MIN / -1, which is checked from the
++  // inputs, off the critical path of the result. Any other dividend takes a slow path that checks the quotient itself.
++  const auto Bits = IR::OpSizeAsBits(Size);
++  Ref NotSignExtended {};
+   if (Size == OpSize::i8Bit) {
+-    Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
+-    Src1 = _Sbfe(OpSize::i64Bit, 16, 0, Src1);
+-    Divisor = _Sbfe(OpSize::i64Bit, 8, 0, Divisor);
++    Ref AX = LoadGPRRegister(X86State::REG_RAX);
++    NotSignExtended = _Xor(OpSize::i64Bit, _Sbfe(OpSize::i64Bit, 16, 0, AX), _Sbfe(OpSize::i64Bit, 8, 0, AX));
++  } else {
++    Ref SignOfLow = _Sbfe(OpSize::i64Bit, 1, Bits - 1, LoadGPRRegister(X86State::REG_RAX));
++    NotSignExtended = _Xor(OpSize::i64Bit, _Sbfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RDX)), SignOfLow);
++  }
+ 
+-    _Div(OpSize::i64Bit, Src1, Invalid(), Divisor, Quotient, Remainder);
++  auto FastBlock = CreateNewCodeBlockAfter(GetCurrentBlock());
++  auto SlowBlock = CreateNewCodeBlockAfter(FastBlock);
++  auto ExitBlock = CreateNewCodeBlockAfter(SlowBlock);
++  CondJump(NotSignExtended, SlowBlock, FastBlock, CondClass::NEQ);
+ 
+-    // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
+-    auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
+-    StoreGPRRegister(X86State::REG_RAX, ResultAX, OpSize::i16Bit);
+-  } else {
+-    Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
+-    Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
++  for (bool Slow : {false, true}) {
++    SetCurrentCodeBlock(Slow ? SlowBlock : FastBlock);
++    StartNewBlock();
+ 
+-    _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
++    if (!Slow) {
++      // MIN / -1: (Low ^ MIN) | (Divisor + 1) is zero exactly then (both sign-extended to 64 bits).
++      Ref Low = _Sbfe(OpSize::i64Bit, Bits, 0, LoadGPRRegister(X86State::REG_RAX));
++      Ref Divisor = _Sbfe(OpSize::i64Bit, Bits, 0, LoadSourceGPR(Op, Op->Dest, Op->Flags));
++      Ref Min = Constant(-(int64_t(1) << (Bits - 1)));
++      DivideErrorIf(Op, _Or(OpSize::i64Bit, _Xor(OpSize::i64Bit, Low, Min), _Add(OpSize::i64Bit, Divisor, Constant(1))), CondClass::EQ);
++    }
+ 
+-    if (Size == OpSize::i32Bit) {
+-      Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
+-      Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
+-      Size = OpSize::iInvalid;
++    // This loads the divisor
++    Ref Divisor = LoadSourceGPR(Op, Op->Dest, Op->Flags);
++
++    Ref Quotient = _AllocateGPR(true);
++    Ref Remainder = _AllocateGPR(true);
++    Ref FaultMask {};
++
++    // Slow path only: an all-ones FaultMask when the quotient does not fit; RAX/RDX are then blended back to their
++    // old values (see DivideErrorIf).
++    auto OverflowMask = [this](Ref Overflow) -> Ref {
++      // Overflow | -Overflow has the sign bit set exactly when Overflow is non-zero.
++      return _Sbfe(OpSize::i64Bit, 1, 63, _Or(OpSize::i64Bit, Overflow, _Sub(OpSize::i64Bit, Constant(0), Overflow)));
++    };
++    auto Blend = [this, &FaultMask](Ref Result, Ref Old) -> Ref {
++      if (!FaultMask) {
++        return Result;
++      }
++      return _Xor(OpSize::i64Bit, Result, _And(OpSize::i64Bit, _Xor(OpSize::i64Bit, Result, Old), FaultMask));
++    };
++
++    if (Size == OpSize::i8Bit) {
++      Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
++      Ref Dividend = _Sbfe(OpSize::i64Bit, 16, 0, Src1);
++      Divisor = _Sbfe(OpSize::i64Bit, 8, 0, Divisor);
++
++      _Div(OpSize::i64Bit, Dividend, Invalid(), Divisor, Quotient, Remainder);
++
++      if (Slow) {
++        // The 64-bit divide of the sign-extended operands is exact.
++        FaultMask = OverflowMask(_Xor(OpSize::i64Bit, Quotient, _Sbfe(OpSize::i64Bit, 8, 0, Quotient)));
++      }
++
++      // AX[15:0] = concat<URem[7:0]:UDiv[7:0]>
++      auto ResultAX = _Bfi(GPRSize, 8, 8, Quotient, Remainder);
++      StoreGPRRegister(X86State::REG_RAX, Blend(ResultAX, Src1), OpSize::i16Bit);
++    } else {
++      Ref Src1 = LoadGPRRegister(X86State::REG_RAX);
++      Ref Src2 = LoadGPRRegister(X86State::REG_RDX);
++
++      _Div(Size, Src1, Src2, Divisor, Quotient, Remainder);
++
++      if (Slow && Size == OpSize::i64Bit) {
++        // The 128/64 divide truncates an overflowing quotient, so check Quotient * Divisor + Remainder == RDX:RAX.
++        // The low 64 bits always agree; compare the high half of the 128-bit sum. The sign bit of Carry is set
++        // exactly when SumLo < ProdLo (unsigned), i.e. on a carry out of the low half.
++        Ref ProdLo = _Mul(OpSize::i64Bit, Quotient, Divisor);
++        Ref SumLo = _Add(OpSize::i64Bit, ProdLo, Remainder);
++        Ref Diff = _Sub(OpSize::i64Bit, SumLo, ProdLo);
++        Ref Carry = _Or(OpSize::i64Bit, _Andn(OpSize::i64Bit, ProdLo, SumLo), _Andn(OpSize::i64Bit, Diff, _Xor(OpSize::i64Bit, SumLo, ProdLo)));
++        Ref SumHi = _Add(OpSize::i64Bit, _MulH(OpSize::i64Bit, Quotient, Divisor), _Sbfe(OpSize::i64Bit, 1, 63, Remainder));
++        SumHi = _Add(OpSize::i64Bit, SumHi, _Bfe(OpSize::i64Bit, 1, 63, Carry));
++        FaultMask = OverflowMask(_Xor(OpSize::i64Bit, SumHi, Src2));
++      } else if (Slow) {
++        // 16-bit divides run as an exact 32-bit divide, 32-bit ones as a 64-bit divide (whose only overflow,
++        // INT64_MIN / -1, leaves a quotient that does not fit in 32 bits either).
++        Ref Wide = Size == OpSize::i16Bit ? _Sbfe(OpSize::i64Bit, 32, 0, Quotient) : Quotient;
++        FaultMask = OverflowMask(_Xor(OpSize::i64Bit, Wide, _Sbfe(OpSize::i64Bit, Bits, 0, Quotient)));
++      }
++
++      auto StoreSize = Size;
++      if (Size == OpSize::i32Bit) {
++        Quotient = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Quotient);
++        Remainder = _Bfe(OpSize::i32Bit, IR::OpSizeAsBits(Size), 0, Remainder);
++        StoreSize = OpSize::iInvalid;
++      }
++
++      StoreGPRRegister(X86State::REG_RAX, Blend(Quotient, Src1), StoreSize);
++      StoreGPRRegister(X86State::REG_RDX, Blend(Remainder, Src2), StoreSize);
+     }
+ 
+-    StoreGPRRegister(X86State::REG_RAX, Quotient, Size);
+-    StoreGPRRegister(X86State::REG_RDX, Remainder, Size);
++    if (FaultMask) {
++      DivideErrorIf(Op, FaultMask, CondClass::NEQ);
++    }
++    Jump(ExitBlock);
+   }
++
++  SetCurrentCodeBlock(ExitBlock);
++  StartNewBlock();
+ }
+ 
+ void OpDispatchBuilder::BSFOp(OpcodeArgs) {
+diff --git a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+index f493402..4f7c59f 100644
+--- a/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
++++ b/FEXCore/Source/Interface/Core/OpcodeDispatcher.h
+@@ -458,6 +458,7 @@ public:
+   void INCOp(OpcodeArgs);
+   void DECOp(OpcodeArgs);
+   void NEGOp(OpcodeArgs);
++  void DivideErrorIf(OpcodeArgs, Ref Src, CondClass Cond, unsigned Bit = 0);
+   void DIVOp(OpcodeArgs);
+   void IDIVOp(OpcodeArgs);
+   void BSFOp(OpcodeArgs);
+diff --git a/FEXCore/include/FEXCore/Core/SignalDelegator.h b/FEXCore/include/FEXCore/Core/SignalDelegator.h
+index 4386f0c..7063b18 100644
+--- a/FEXCore/include/FEXCore/Core/SignalDelegator.h
++++ b/FEXCore/include/FEXCore/Core/SignalDelegator.h
+@@ -14,10 +14,12 @@ namespace Core {
+     FAULT_SIGSEGV = SIGSEGV,
+     FAULT_SIGTRAP = SIGTRAP,
+     FAULT_SIGILL = SIGILL,
++    FAULT_SIGFPE = SIGFPE,
+ #else
+     FAULT_SIGSEGV = 11,
+     FAULT_SIGTRAP = 5,
+     FAULT_SIGILL = 4,
++    FAULT_SIGFPE = 8,
+ #endif
+   };
+ } // namespace Core
+diff --git a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+index 6383774..e46a42d 100644
+--- a/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
++++ b/Source/Tools/LinuxEmulation/LinuxSyscalls/SignalDelegator.cpp
+@@ -732,6 +732,14 @@ bool SignalDelegator::HandleFrontendSIGSEGV(FEXCore::Core::InternalThreadState*
+ void SignalDelegator::HandleGuestSignal(FEX::HLE::ThreadStateObject* ThreadObject, int Signal, void* Info, void* UContext) {
+   auto Thread = ThreadObject->Thread;
+ 
++  // A generated exception whose signal has no host trampoline of its own (SIGFPE for #DE) leaves the JIT through the
++  // SIGTRAP one; deliver it as the signal it stands for, with that signal's guest disposition.
++  if (Signal == SIGTRAP && Thread->CurrentFrame->SynchronousFaultData.FaultToTopAndGeneratedException &&
++      Thread->CurrentFrame->SynchronousFaultData.Signal == SIGFPE) {
++    Signal = SIGFPE;
++    static_cast<siginfo_t*>(Info)->si_signo = SIGFPE;
++  }
++
+   if (PtraceEmu::TryGuestSignalStop(Thread->CurrentFrame, Signal)) {
+     // A ptrace tracer was shown this guest int3/fault as a signal-delivery stop and suppressed it: resume the guest
+     // at the (possibly rewritten) register state instead of delivering the signal.
+diff --git a/Source/Windows/Common/Exception.h b/Source/Windows/Common/Exception.h
+index 1216223..33b7954 100644
+--- a/Source/Windows/Common/Exception.h
++++ b/Source/Windows/Common/Exception.h
+@@ -25,6 +25,14 @@ static inline EXCEPTION_RECORD HandleGuestException(FEXCore::Core::CpuStateFrame
+ 
+   switch (Fault.Signal) {
+   case FEXCore::Core::FAULT_SIGILL: Dst.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION; return Dst;
++  case FEXCore::Core::FAULT_SIGFPE:
++    if (Fault.TrapNo == FEXCore::X86State::X86_TRAPNO_DE) {
++      // Like Wine on Linux, report every #DE (zero divisor or quotient overflow) as an integer divide by zero.
++      Dst.ExceptionCode = EXCEPTION_INT_DIVIDE_BY_ZERO;
++      return Dst;
++    }
++    LogMan::Msg::EFmt("Unknown SIGFPE trap: {}", Fault.TrapNo);
++    break;
+   case FEXCore::Core::FAULT_SIGTRAP:
+     switch (Fault.TrapNo) {
+     case FEXCore::X86State::X86_TRAPNO_DB: Dst.ExceptionCode = EXCEPTION_SINGLE_STEP; return Dst;
+diff --git a/unittests/InstructionCountCI/AFP/H0F3A.json b/unittests/InstructionCountCI/AFP/H0F3A.json
+index 4854022..002960c 100644
+--- a/unittests/InstructionCountCI/AFP/H0F3A.json
++++ b/unittests/InstructionCountCI/AFP/H0F3A.json
+@@ -8,7 +8,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "roundss xmm0, xmm1, 00000000b": {
+diff --git a/unittests/InstructionCountCI/AFP/SVE256/Secondary.json b/unittests/InstructionCountCI/AFP/SVE256/Secondary.json
+index e1c3e4a..a1586b3 100644
+--- a/unittests/InstructionCountCI/AFP/SVE256/Secondary.json
++++ b/unittests/InstructionCountCI/AFP/SVE256/Secondary.json
+@@ -7,7 +7,7 @@
+       "AFP"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtpi2ps xmm0, [rax]": {
+diff --git a/unittests/InstructionCountCI/AFP/SVE256/Secondary_REP.json b/unittests/InstructionCountCI/AFP/SVE256/Secondary_REP.json
+index dc712f1..ed05be4 100644
+--- a/unittests/InstructionCountCI/AFP/SVE256/Secondary_REP.json
++++ b/unittests/InstructionCountCI/AFP/SVE256/Secondary_REP.json
+@@ -9,7 +9,7 @@
+     "DisabledHostFeatures": [
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtsi2ss xmm0, eax": {
+diff --git a/unittests/InstructionCountCI/AFP/SVE256/Secondary_REPNE.json b/unittests/InstructionCountCI/AFP/SVE256/Secondary_REPNE.json
+index 0868ca1..532d1f5 100644
+--- a/unittests/InstructionCountCI/AFP/SVE256/Secondary_REPNE.json
++++ b/unittests/InstructionCountCI/AFP/SVE256/Secondary_REPNE.json
+@@ -7,7 +7,7 @@
+       "AFP"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtsi2sd xmm0, eax": {
+diff --git a/unittests/InstructionCountCI/AFP/Secondary.json b/unittests/InstructionCountCI/AFP/Secondary.json
+index 76274e3..a853cc4 100644
+--- a/unittests/InstructionCountCI/AFP/Secondary.json
++++ b/unittests/InstructionCountCI/AFP/Secondary.json
+@@ -8,7 +8,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtpi2ps xmm0, [rax]": {
+diff --git a/unittests/InstructionCountCI/AFP/Secondary_REP.json b/unittests/InstructionCountCI/AFP/Secondary_REP.json
+index a1c411e..3d6cbeb 100644
+--- a/unittests/InstructionCountCI/AFP/Secondary_REP.json
++++ b/unittests/InstructionCountCI/AFP/Secondary_REP.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtsi2ss xmm0, eax": {
+diff --git a/unittests/InstructionCountCI/AFP/Secondary_REPNE.json b/unittests/InstructionCountCI/AFP/Secondary_REPNE.json
+index b15f325..a2aca19 100644
+--- a/unittests/InstructionCountCI/AFP/Secondary_REPNE.json
++++ b/unittests/InstructionCountCI/AFP/Secondary_REPNE.json
+@@ -8,7 +8,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtsi2sd xmm0, eax": {
+diff --git a/unittests/InstructionCountCI/AFP/VEX_map1.json b/unittests/InstructionCountCI/AFP/VEX_map1.json
+index 8013a2d..f29ce4e 100644
+--- a/unittests/InstructionCountCI/AFP/VEX_map1.json
++++ b/unittests/InstructionCountCI/AFP/VEX_map1.json
+@@ -9,7 +9,7 @@
+     "DisabledHostFeatures": [
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vsqrtss xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AFP/VEX_map3.json b/unittests/InstructionCountCI/AFP/VEX_map3.json
+index effc157..17a3ae7 100644
+--- a/unittests/InstructionCountCI/AFP/VEX_map3.json
++++ b/unittests/InstructionCountCI/AFP/VEX_map3.json
+@@ -7,7 +7,7 @@
+       "AFP"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vroundss xmm0, xmm1, 00000000b": {
+diff --git a/unittests/InstructionCountCI/AVX128/FMA4.json b/unittests/InstructionCountCI/AVX128/FMA4.json
+index 540e423..e7122d1 100644
+--- a/unittests/InstructionCountCI/AVX128/FMA4.json
++++ b/unittests/InstructionCountCI/AVX128/FMA4.json
+@@ -7,7 +7,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vfmaddsubps xmm0, xmm1, xmm2, xmm3": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map1.json b/unittests/InstructionCountCI/AVX128/VEX_map1.json
+index ace54c9..09d18d9 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map1.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map1.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vmovups xmm0, xmm0": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map1_FCMA.json b/unittests/InstructionCountCI/AVX128/VEX_map1_FCMA.json
+index f6abc32..29a0453 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map1_FCMA.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map1_FCMA.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vaddsubpd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map1_SVE128.json b/unittests/InstructionCountCI/AVX128/VEX_map1_SVE128.json
+index 8785aa0..964f754 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map1_SVE128.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map1_SVE128.json
+@@ -10,7 +10,7 @@
+       "FLAGM2",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vmovntps [rax], xmm0": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map1_flagm.json b/unittests/InstructionCountCI/AVX128/VEX_map1_flagm.json
+index dbfea19..1a8f8e9 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map1_flagm.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map1_flagm.json
+@@ -10,7 +10,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vucomiss xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2.json b/unittests/InstructionCountCI/AVX128/VEX_map2.json
+index 0890b5b..792ea99 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2.json
+@@ -11,7 +11,7 @@
+       "I8MM",
+       "DOTPROD"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpshufb xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2_AFP.json b/unittests/InstructionCountCI/AVX128/VEX_map2_AFP.json
+index 62902ca..9d705fd 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2_AFP.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2_AFP.json
+@@ -8,7 +8,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vfmadd132ss xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2_DOTPROD.json b/unittests/InstructionCountCI/AVX128/VEX_map2_DOTPROD.json
+index c4e22df..9484a30 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2_DOTPROD.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2_DOTPROD.json
+@@ -12,7 +12,7 @@
+       "SVE256",
+       "I8MM"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpdpbusd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2_I8MM.json b/unittests/InstructionCountCI/AVX128/VEX_map2_I8MM.json
+index 81aefa6..764a6c8 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2_I8MM.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2_I8MM.json
+@@ -11,7 +11,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpdpbusd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2_SVE128.json b/unittests/InstructionCountCI/AVX128/VEX_map2_SVE128.json
+index ac33e1d..8643eda 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2_SVE128.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2_SVE128.json
+@@ -10,7 +10,7 @@
+       "FLAGM2",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vmovntdqa xmm0, [rax]": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map2_flagm.json b/unittests/InstructionCountCI/AVX128/VEX_map2_flagm.json
+index b6bfd7a..5ba4df7 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map2_flagm.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map2_flagm.json
+@@ -11,7 +11,7 @@
+       "SVE256",
+       "SVEBITPERM"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vtestps xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map3.json b/unittests/InstructionCountCI/AVX128/VEX_map3.json
+index 9a97205..2ade3af 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map3.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map3.json
+@@ -7,7 +7,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpermq ymm0, ymm1, 1": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map3_SVE128.json b/unittests/InstructionCountCI/AVX128/VEX_map3_SVE128.json
+index daac43d..a1b5f99 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map3_SVE128.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map3_SVE128.json
+@@ -8,7 +8,7 @@
+       "AFP",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vblendvps xmm0, xmm1, xmm2, xmm3": {
+diff --git a/unittests/InstructionCountCI/AVX128/VEX_map_group.json b/unittests/InstructionCountCI/AVX128/VEX_map_group.json
+index b2c80a6..2cd313b 100644
+--- a/unittests/InstructionCountCI/AVX128/VEX_map_group.json
++++ b/unittests/InstructionCountCI/AVX128/VEX_map_group.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "SVE128"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpsrlw xmm0, xmm1, 0": {
+diff --git a/unittests/InstructionCountCI/Atomics.json b/unittests/InstructionCountCI/Atomics.json
+index bb87330..c40f7d2 100644
+--- a/unittests/InstructionCountCI/Atomics.json
++++ b/unittests/InstructionCountCI/Atomics.json
+@@ -9,7 +9,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "lock add byte [rax], cl": {
+diff --git a/unittests/InstructionCountCI/Crypto/H0F38.json b/unittests/InstructionCountCI/Crypto/H0F38.json
+index 521618c..1c65cea 100644
+--- a/unittests/InstructionCountCI/Crypto/H0F38.json
++++ b/unittests/InstructionCountCI/Crypto/H0F38.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "sha1nexte xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Crypto/H0F38_SVE128.json b/unittests/InstructionCountCI/Crypto/H0F38_SVE128.json
+index 10aa14e..ddc09e0 100644
+--- a/unittests/InstructionCountCI/Crypto/H0F38_SVE128.json
++++ b/unittests/InstructionCountCI/Crypto/H0F38_SVE128.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "sha1nexte xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Crypto/H0F3A.json b/unittests/InstructionCountCI/Crypto/H0F3A.json
+index 554cfcc..7554d20 100644
+--- a/unittests/InstructionCountCI/Crypto/H0F3A.json
++++ b/unittests/InstructionCountCI/Crypto/H0F3A.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pclmulqdq xmm0, xmm1, 00000b": {
+diff --git a/unittests/InstructionCountCI/DDD.json b/unittests/InstructionCountCI/DDD.json
+index 50cf84d..2a1f76d 100644
+--- a/unittests/InstructionCountCI/DDD.json
++++ b/unittests/InstructionCountCI/DDD.json
+@@ -10,7 +10,7 @@
+       "AFP",
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These 3DNow! instructions are optimal assuming that FEX doesn't SRA MMX registers",
+diff --git a/unittests/InstructionCountCI/FEXOpt/AddressingLimitations.json b/unittests/InstructionCountCI/FEXOpt/AddressingLimitations.json
+index aeed658..732b443 100644
+--- a/unittests/InstructionCountCI/FEXOpt/AddressingLimitations.json
++++ b/unittests/InstructionCountCI/FEXOpt/AddressingLimitations.json
+@@ -8,7 +8,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "Instructions that explicitly push against the limits of ARM's loadstore instructions"
+diff --git a/unittests/InstructionCountCI/FEXOpt/AddressingLimitations_32Bit.json b/unittests/InstructionCountCI/FEXOpt/AddressingLimitations_32Bit.json
+index d0944cf..aa51c88 100644
+--- a/unittests/InstructionCountCI/FEXOpt/AddressingLimitations_32Bit.json
++++ b/unittests/InstructionCountCI/FEXOpt/AddressingLimitations_32Bit.json
+@@ -8,7 +8,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "Instructions that explicitly push against the limits of ARM's loadstore instructions"
+diff --git a/unittests/InstructionCountCI/FEXOpt/MultiInst.json b/unittests/InstructionCountCI/FEXOpt/MultiInst.json
+index 0cb0493..59aa1eb 100644
+--- a/unittests/InstructionCountCI/FEXOpt/MultiInst.json
++++ b/unittests/InstructionCountCI/FEXOpt/MultiInst.json
+@@ -13,7 +13,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These are instruction combinations that could be more optimal if FEX optimized for them"
+@@ -61,7 +61,7 @@
+     },
+     "signed div narrow": {
+       "x86InstructionCount": 2,
+-      "ExpectedInstructionCount": 5,
++      "ExpectedInstructionCount": 95,
+       "Comment": [
+         "div narrowing with known smaller sources",
+         "dividend in rdx:rax"
+@@ -72,15 +72,105 @@
+       ],
+       "ExpectedArm64ASM": [
+         "asr x5, x4, #63",
++        "cbz x7, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x2",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "asr x20, x4, #63",
++        "asr x21, x5, #0",
++        "eor x20, x21, x20",
++        "cbnz x20, #+0x88",
++        "asr x20, x4, #0",
++        "asr x21, x7, #0",
++        "eor x20, x20, #0x8000000000000000",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x2",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "asr x0, x4, #63",
++        "eor x0, x0, x5",
++        "cbz x0, #+0x2c",
++        "mov x0, x5",
++        "mov x1, x4",
++        "mov x2, x7",
++        "ldr x3, [x28, #3056]",
++        "str x30, [sp, #-16]!",
++        "blr x3",
++        "ldr x30, [sp], #16",
++        "mov x20, x0",
++        "mov x22, x1",
++        "b #+0xc",
+         "sdiv x20, x4, x7",
+         "msub x22, x20, x7, x4",
+         "mov x5, x22",
+-        "mov x4, x20"
++        "mov x4, x20",
++        "b #+0xc0",
++        "asr x0, x4, #63",
++        "eor x0, x0, x5",
++        "cbz x0, #+0x2c",
++        "mov x0, x5",
++        "mov x1, x4",
++        "mov x2, x7",
++        "ldr x3, [x28, #3056]",
++        "str x30, [sp, #-16]!",
++        "blr x3",
++        "ldr x30, [sp], #16",
++        "mov x20, x0",
++        "mov x22, x1",
++        "b #+0xc",
++        "sdiv x20, x4, x7",
++        "msub x22, x20, x7, x4",
++        "mul x21, x20, x7",
++        "add x23, x21, x22",
++        "sub x24, x23, x21",
++        "bic x30, x21, x23",
++        "eor x21, x23, x21",
++        "bic x21, x24, x21",
++        "orr x21, x30, x21",
++        "smulh x23, x20, x7",
++        "asr x24, x22, #63",
++        "add x23, x23, x24",
++        "lsr x21, x21, #63",
++        "add x21, x23, x21",
++        "eor x21, x21, x5",
++        "neg x23, x21",
++        "orr x21, x21, x23",
++        "asr x21, x21, #63",
++        "eor x23, x20, x4",
++        "and x23, x23, x21",
++        "eor x4, x20, x23",
++        "eor x20, x22, x5",
++        "and x20, x20, x21",
++        "eor x5, x22, x20",
++        "cbnz x21, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x2",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "unsigned div narrow": {
+       "x86InstructionCount": 2,
+-      "ExpectedInstructionCount": 5,
++      "ExpectedInstructionCount": 31,
+       "Comment": [
+         "div narrowing with known smaller sources",
+         "dividend in rdx:rax"
+@@ -91,6 +181,32 @@
+       ],
+       "ExpectedArm64ASM": [
+         "mov w5, #0x0",
++        "sub x20, x5, x7",
++        "bic x21, x7, x5",
++        "eor x22, x5, x7",
++        "bic x20, x20, x22",
++        "orr x20, x21, x20",
++        "tbz x20, #63, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x5",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "cbz x5, #+0x2c",
++        "mov x0, x5",
++        "mov x1, x4",
++        "mov x2, x7",
++        "ldr x3, [x28, #3048]",
++        "str x30, [sp, #-16]!",
++        "blr x3",
++        "ldr x30, [sp], #16",
++        "mov x20, x0",
++        "mov x22, x1",
++        "b #+0xc",
+         "udiv x20, x4, x7",
+         "msub x22, x20, x7, x4",
+         "mov x5, x22",
+@@ -99,7 +215,7 @@
+     },
+     "unsigned div narrow with flags": {
+       "x86InstructionCount": 2,
+-      "ExpectedInstructionCount": 6,
++      "ExpectedInstructionCount": 32,
+       "Comment": [
+         "div narrowing with known smaller sources",
+         "dividend in rdx:rax"
+@@ -111,6 +227,32 @@
+       "ExpectedArm64ASM": [
+         "subs w26, w5, w5",
+         "mov w5, #0x0",
++        "sub x20, x5, x7",
++        "bic x21, x7, x5",
++        "eor x22, x5, x7",
++        "bic x20, x20, x22",
++        "orr x20, x21, x20",
++        "tbz x20, #63, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x3",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "cbz x5, #+0x2c",
++        "mov x0, x5",
++        "mov x1, x4",
++        "mov x2, x7",
++        "ldr x3, [x28, #3048]",
++        "str x30, [sp, #-16]!",
++        "blr x3",
++        "ldr x30, [sp], #16",
++        "mov x20, x0",
++        "mov x22, x1",
++        "b #+0xc",
+         "udiv x20, x4, x7",
+         "msub x22, x20, x7, x4",
+         "mov x5, x22",
+@@ -119,7 +261,7 @@
+     },
+     "signed div narrow 32-bit": {
+       "x86InstructionCount": 3,
+-      "ExpectedInstructionCount": 10,
++      "ExpectedInstructionCount": 71,
+       "x86Insts": [
+         "mov    eax, edi",
+         "cdq",
+@@ -129,18 +271,79 @@
+         "mov w4, w11",
+         "asr w5, w4, #31",
+         "mov w20, w10",
++        "cbz w20, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x3",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "sbfx x20, x4, #31, #1",
++        "sxtw x21, w5",
++        "eor x20, x21, x20",
++        "cbnz x20, #+0x68",
++        "sxtw x20, w4",
++        "mov w21, w10",
++        "sxtw x21, w21",
++        "eor x20, x20, #0xffffffff80000000",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x3",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "mov w20, w10",
+         "mov x0, x4",
+         "bfi x0, x5, #32, #32",
+         "sxtw x1, w20",
+         "sdiv x22, x0, x1",
+         "msub x21, x22, x1, x0",
+         "mov w4, w22",
+-        "mov w5, w21"
++        "mov w5, w21",
++        "b #+0x78",
++        "mov w20, w10",
++        "mov x0, x4",
++        "bfi x0, x5, #32, #32",
++        "sxtw x1, w20",
++        "sdiv x22, x0, x1",
++        "msub x21, x22, x1, x0",
++        "sxtw x20, w22",
++        "eor x20, x22, x20",
++        "neg x23, x20",
++        "orr x20, x20, x23",
++        "asr x20, x20, #63",
++        "mov w22, w22",
++        "mov w21, w21",
++        "eor x23, x22, x4",
++        "and x23, x23, x20",
++        "eor x4, x22, x23",
++        "eor x22, x21, x5",
++        "and x22, x22, x20",
++        "eor x5, x21, x22",
++        "cbnz x20, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x3",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "unsigned div narrow 32-bit": {
+       "x86InstructionCount": 3,
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 23,
+       "x86Insts": [
+         "mov    eax, edi",
+         "xor    edx, edx",
+@@ -150,8 +353,24 @@
+         "mov w4, w11",
+         "subs w26, w5, w5",
+         "mov w5, #0x0",
+-        "udiv w20, w4, w10",
+-        "msub w22, w20, w10, w4",
++        "mov w20, w5",
++        "mov w21, w10",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x24",
++        "mov w20, #0x4",
++        "movk w20, #0x1, lsl #16",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "mov w1, w10",
++        "mov x0, x4",
++        "bfi x0, x5, #32, #32",
++        "udiv x20, x0, x1",
++        "msub x22, x20, x1, x0",
+         "mov w4, w20",
+         "mov w5, w22"
+       ]
+diff --git a/unittests/InstructionCountCI/FEXOpt/MultiInst_32bit.json b/unittests/InstructionCountCI/FEXOpt/MultiInst_32bit.json
+index 5017cba..c73f3e0 100644
+--- a/unittests/InstructionCountCI/FEXOpt/MultiInst_32bit.json
++++ b/unittests/InstructionCountCI/FEXOpt/MultiInst_32bit.json
+@@ -11,7 +11,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These are instruction combinations that could be more optimal if FEX optimized for them"
+diff --git a/unittests/InstructionCountCI/FEXOpt/MultiInst_AFP.json b/unittests/InstructionCountCI/FEXOpt/MultiInst_AFP.json
+index c1383bb..43c8eeb 100644
+--- a/unittests/InstructionCountCI/FEXOpt/MultiInst_AFP.json
++++ b/unittests/InstructionCountCI/FEXOpt/MultiInst_AFP.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These are instruction combinations that could be more optimal if FEX optimized for them"
+diff --git a/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO.json b/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO.json
+index cf96881..5d76717 100644
+--- a/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO.json
++++ b/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO.json
+@@ -14,7 +14,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These are instruction combinations that could be more optimal if FEX optimized for them"
+diff --git a/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO_32bit.json b/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO_32bit.json
+index 9f1a80f..79e2650 100644
+--- a/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO_32bit.json
++++ b/unittests/InstructionCountCI/FEXOpt/MultiInst_TSO_32bit.json
+@@ -14,7 +14,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "These are instruction combinations that could be more optimal if FEX optimized for them"
+diff --git a/unittests/InstructionCountCI/FEXOpt/Peephole.json b/unittests/InstructionCountCI/FEXOpt/Peephole.json
+index dfa88af..c0e799f 100644
+--- a/unittests/InstructionCountCI/FEXOpt/Peephole.json
++++ b/unittests/InstructionCountCI/FEXOpt/Peephole.json
+@@ -11,7 +11,7 @@
+       "I8MM",
+       "DOTPROD"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "This file tracks the translations for the 'peephole' optimizations in FEX.",
+diff --git a/unittests/InstructionCountCI/FEXOpt/Peephole_SVE128.json b/unittests/InstructionCountCI/FEXOpt/Peephole_SVE128.json
+index 5c38dcd..61afb6a 100644
+--- a/unittests/InstructionCountCI/FEXOpt/Peephole_SVE128.json
++++ b/unittests/InstructionCountCI/FEXOpt/Peephole_SVE128.json
+@@ -10,7 +10,7 @@
+       "FLAGM2",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "This file tracks the translations for the 'peephole' optimizations in FEX.",
+diff --git a/unittests/InstructionCountCI/FEXOpt/libnss.json b/unittests/InstructionCountCI/FEXOpt/libnss.json
+index da393c9..4c15d99 100644
+--- a/unittests/InstructionCountCI/FEXOpt/libnss.json
++++ b/unittests/InstructionCountCI/FEXOpt/libnss.json
+@@ -12,7 +12,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [],
+   "Instructions": {
+diff --git a/unittests/InstructionCountCI/FlagM/Atomics.json b/unittests/InstructionCountCI/FlagM/Atomics.json
+index 07be3de..d504524 100644
+--- a/unittests/InstructionCountCI/FlagM/Atomics.json
++++ b/unittests/InstructionCountCI/FlagM/Atomics.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "lock add byte [rax], cl": {
+diff --git a/unittests/InstructionCountCI/FlagM/FlagOpts.json b/unittests/InstructionCountCI/FlagM/FlagOpts.json
+index 4d8244b..4c76296 100644
+--- a/unittests/InstructionCountCI/FlagM/FlagOpts.json
++++ b/unittests/InstructionCountCI/FlagM/FlagOpts.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Chained add": {
+diff --git a/unittests/InstructionCountCI/FlagM/H0F38.json b/unittests/InstructionCountCI/FlagM/H0F38.json
+index 74de321..50d7f9f 100644
+--- a/unittests/InstructionCountCI/FlagM/H0F38.json
++++ b/unittests/InstructionCountCI/FlagM/H0F38.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "ptest xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/FlagM/HotBlocks.json b/unittests/InstructionCountCI/FlagM/HotBlocks.json
+index ffa2060..1cae5c7 100644
+--- a/unittests/InstructionCountCI/FlagM/HotBlocks.json
++++ b/unittests/InstructionCountCI/FlagM/HotBlocks.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "The Witcher 3": {
+diff --git a/unittests/InstructionCountCI/FlagM/HotBlocks_32Bit.json b/unittests/InstructionCountCI/FlagM/HotBlocks_32Bit.json
+index d31e74a..eeb2928 100644
+--- a/unittests/InstructionCountCI/FlagM/HotBlocks_32Bit.json
++++ b/unittests/InstructionCountCI/FlagM/HotBlocks_32Bit.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Sonic Mania movie player": {
+diff --git a/unittests/InstructionCountCI/FlagM/HotBlocks_AFP.json b/unittests/InstructionCountCI/FlagM/HotBlocks_AFP.json
+index c746c70..14ef9a0 100644
+--- a/unittests/InstructionCountCI/FlagM/HotBlocks_AFP.json
++++ b/unittests/InstructionCountCI/FlagM/HotBlocks_AFP.json
+@@ -10,7 +10,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "FMOD scalar loop": {
+diff --git a/unittests/InstructionCountCI/FlagM/HotBlocks_TSO_32Bit.json b/unittests/InstructionCountCI/FlagM/HotBlocks_TSO_32Bit.json
+index 7395b1d..dc2a7e6 100644
+--- a/unittests/InstructionCountCI/FlagM/HotBlocks_TSO_32Bit.json
++++ b/unittests/InstructionCountCI/FlagM/HotBlocks_TSO_32Bit.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "The Sims 1 hot block": {
+diff --git a/unittests/InstructionCountCI/FlagM/Primary.json b/unittests/InstructionCountCI/FlagM/Primary.json
+index 20f7731..1c6a3f5 100644
+--- a/unittests/InstructionCountCI/FlagM/Primary.json
++++ b/unittests/InstructionCountCI/FlagM/Primary.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "add bl, cl": {
+diff --git a/unittests/InstructionCountCI/FlagM/PrimaryGroup.json b/unittests/InstructionCountCI/FlagM/PrimaryGroup.json
+index fa74d42..2e50e73 100644
+--- a/unittests/InstructionCountCI/FlagM/PrimaryGroup.json
++++ b/unittests/InstructionCountCI/FlagM/PrimaryGroup.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "add al, 1": {
+@@ -2154,9 +2154,21 @@
+       ]
+     },
+     "div bl": {
+-      "ExpectedInstructionCount": 6,
++      "ExpectedInstructionCount": 18,
+       "Comment": "GROUP2 0xf6 /6",
+       "ExpectedArm64ASM": [
++        "ubfx x20, x4, #8, #8",
++        "uxtb x21, w6",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxtb w20, w6",
+         "uxth w23, w4",
+         "udiv w22, w23, w20",
+@@ -2166,16 +2178,70 @@
+       ]
+     },
+     "idiv bl": {
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 61,
+       "Comment": "GROUP2 0xf6 /7",
+       "ExpectedArm64ASM": [
++        "uxtb w20, w6",
++        "cbz w20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "sxth x20, w4",
++        "sxtb x21, w4",
++        "eor x20, x20, x21",
++        "cbnz x20, #+0x60",
++        "sxtb x20, w4",
++        "uxtb w21, w6",
++        "sxtb x21, w21",
++        "eor x20, x20, #0xffffffffffffff80",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxtb w20, w6",
+         "sxth x23, w4",
+         "sxtb x20, w20",
+         "sdiv x22, x23, x20",
+         "msub x21, x22, x20, x23",
+         "bfi x22, x21, #8, #8",
+-        "bfxil x4, x22, #0, #16"
++        "bfxil x4, x22, #0, #16",
++        "b #+0x64",
++        "uxtb w20, w6",
++        "sxth x23, w4",
++        "sxtb x20, w20",
++        "sdiv x22, x23, x20",
++        "msub x21, x22, x20, x23",
++        "sxtb x20, w22",
++        "eor x20, x22, x20",
++        "neg x23, x20",
++        "orr x20, x20, x23",
++        "asr x20, x20, #63",
++        "bfi x22, x21, #8, #8",
++        "eor x21, x22, x4",
++        "and x21, x21, x20",
++        "eor x21, x22, x21",
++        "bfxil x4, x21, #0, #16",
++        "cbnz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "test bx, 1": {
+@@ -2335,9 +2401,21 @@
+       ]
+     },
+     "div bx": {
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 19,
+       "Comment": "GROUP2 0xf7 /6",
+       "ExpectedArm64ASM": [
++        "uxth x20, w5",
++        "uxth x21, w6",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxth w20, w6",
+         "uxth w0, w4",
+         "bfi w0, w5, #16, #16",
+diff --git a/unittests/InstructionCountCI/FlagM/Primary_32Bit.json b/unittests/InstructionCountCI/FlagM/Primary_32Bit.json
+index da471fa..13c944d 100644
+--- a/unittests/InstructionCountCI/FlagM/Primary_32Bit.json
++++ b/unittests/InstructionCountCI/FlagM/Primary_32Bit.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "push es": {
+diff --git a/unittests/InstructionCountCI/FlagM/Secondary.json b/unittests/InstructionCountCI/FlagM/Secondary.json
+index e13c193..8219baa 100644
+--- a/unittests/InstructionCountCI/FlagM/Secondary.json
++++ b/unittests/InstructionCountCI/FlagM/Secondary.json
+@@ -11,7 +11,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "ucomiss xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/FlagM/SecondaryGroup.json b/unittests/InstructionCountCI/FlagM/SecondaryGroup.json
+index 0f31a1e..33c84a6 100644
+--- a/unittests/InstructionCountCI/FlagM/SecondaryGroup.json
++++ b/unittests/InstructionCountCI/FlagM/SecondaryGroup.json
+@@ -11,7 +11,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "sgdt [rax]": {
+diff --git a/unittests/InstructionCountCI/FlagM/SecondaryModRM.json b/unittests/InstructionCountCI/FlagM/SecondaryModRM.json
+index 3cddab7..01cdb7a 100644
+--- a/unittests/InstructionCountCI/FlagM/SecondaryModRM.json
++++ b/unittests/InstructionCountCI/FlagM/SecondaryModRM.json
+@@ -11,7 +11,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "xgetbv": {
+diff --git a/unittests/InstructionCountCI/FlagM/Secondary_OpSize.json b/unittests/InstructionCountCI/FlagM/Secondary_OpSize.json
+index 1dda019..0abc1db 100644
+--- a/unittests/InstructionCountCI/FlagM/Secondary_OpSize.json
++++ b/unittests/InstructionCountCI/FlagM/Secondary_OpSize.json
+@@ -11,7 +11,7 @@
+       "AFP",
+       "FCMA"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "ucomisd xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/FlagM/Secondary_REP.json b/unittests/InstructionCountCI/FlagM/Secondary_REP.json
+index b6f9b68..3203a06 100644
+--- a/unittests/InstructionCountCI/FlagM/Secondary_REP.json
++++ b/unittests/InstructionCountCI/FlagM/Secondary_REP.json
+@@ -12,7 +12,7 @@
+       "AFP",
+       "CSSC"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "popcnt ax, bx": {
+diff --git a/unittests/InstructionCountCI/FlagM/Secondary_REP_CSSC.json b/unittests/InstructionCountCI/FlagM/Secondary_REP_CSSC.json
+index 77d1f33..ac292ef 100644
+--- a/unittests/InstructionCountCI/FlagM/Secondary_REP_CSSC.json
++++ b/unittests/InstructionCountCI/FlagM/Secondary_REP_CSSC.json
+@@ -12,7 +12,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "popcnt ax, bx": {
+diff --git a/unittests/InstructionCountCI/FlagM/VEX_map1.json b/unittests/InstructionCountCI/FlagM/VEX_map1.json
+index 5ec50d0..401cd4e 100644
+--- a/unittests/InstructionCountCI/FlagM/VEX_map1.json
++++ b/unittests/InstructionCountCI/FlagM/VEX_map1.json
+@@ -12,7 +12,7 @@
+       "RPRES",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vucomiss xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/FlagM/VEX_map2.json b/unittests/InstructionCountCI/FlagM/VEX_map2.json
+index 4040ae3..1631017 100644
+--- a/unittests/InstructionCountCI/FlagM/VEX_map2.json
++++ b/unittests/InstructionCountCI/FlagM/VEX_map2.json
+@@ -10,7 +10,7 @@
+       "AFP",
+       "SVEBITPERM"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vtestps xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/FlagM/VEX_map_group.json b/unittests/InstructionCountCI/FlagM/VEX_map_group.json
+index a90f0dd..5f1b065 100644
+--- a/unittests/InstructionCountCI/FlagM/VEX_map_group.json
++++ b/unittests/InstructionCountCI/FlagM/VEX_map_group.json
+@@ -9,7 +9,7 @@
+     "DisabledHostFeatures": [
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "blsr eax, ebx": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87-Crysis2Max-fmodel.json b/unittests/InstructionCountCI/FlagM/x87-Crysis2Max-fmodel.json
+index 7462661..175bc06 100644
+--- a/unittests/InstructionCountCI/FlagM/x87-Crysis2Max-fmodel.json
++++ b/unittests/InstructionCountCI/FlagM/x87-Crysis2Max-fmodel.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87-HalfLife.json b/unittests/InstructionCountCI/FlagM/x87-HalfLife.json
+index 66dd779..e671811 100644
+--- a/unittests/InstructionCountCI/FlagM/x87-HalfLife.json
++++ b/unittests/InstructionCountCI/FlagM/x87-HalfLife.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87-Oblivion.json b/unittests/InstructionCountCI/FlagM/x87-Oblivion.json
+index 7f17688..5006d46 100644
+--- a/unittests/InstructionCountCI/FlagM/x87-Oblivion.json
++++ b/unittests/InstructionCountCI/FlagM/x87-Oblivion.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87-Psychonauts.json b/unittests/InstructionCountCI/FlagM/x87-Psychonauts.json
+index 97564e9..b055dfc 100644
+--- a/unittests/InstructionCountCI/FlagM/x87-Psychonauts.json
++++ b/unittests/InstructionCountCI/FlagM/x87-Psychonauts.json
+@@ -10,7 +10,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87.json b/unittests/InstructionCountCI/FlagM/x87.json
+index f6d573c..ed45597 100644
+--- a/unittests/InstructionCountCI/FlagM/x87.json
++++ b/unittests/InstructionCountCI/FlagM/x87.json
+@@ -11,7 +11,7 @@
+       "CSSC",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fadd dword [rax]": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87_f64-Crysis2Max-fmodel.json b/unittests/InstructionCountCI/FlagM/x87_f64-Crysis2Max-fmodel.json
+index 4e0fc37..85e0ba8 100644
+--- a/unittests/InstructionCountCI/FlagM/x87_f64-Crysis2Max-fmodel.json
++++ b/unittests/InstructionCountCI/FlagM/x87_f64-Crysis2Max-fmodel.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87_f64-HalfLife.json b/unittests/InstructionCountCI/FlagM/x87_f64-HalfLife.json
+index 92f3fa9..37996ca 100644
+--- a/unittests/InstructionCountCI/FlagM/x87_f64-HalfLife.json
++++ b/unittests/InstructionCountCI/FlagM/x87_f64-HalfLife.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87_f64-Oblivion.json b/unittests/InstructionCountCI/FlagM/x87_f64-Oblivion.json
+index 4269279..95072f5 100644
+--- a/unittests/InstructionCountCI/FlagM/x87_f64-Oblivion.json
++++ b/unittests/InstructionCountCI/FlagM/x87_f64-Oblivion.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87_f64-Psychonauts.json b/unittests/InstructionCountCI/FlagM/x87_f64-Psychonauts.json
+index 686a2dc..d104616 100644
+--- a/unittests/InstructionCountCI/FlagM/x87_f64-Psychonauts.json
++++ b/unittests/InstructionCountCI/FlagM/x87_f64-Psychonauts.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Block1": {
+diff --git a/unittests/InstructionCountCI/FlagM/x87_f64.json b/unittests/InstructionCountCI/FlagM/x87_f64.json
+index 98d9be2..5b09339 100644
+--- a/unittests/InstructionCountCI/FlagM/x87_f64.json
++++ b/unittests/InstructionCountCI/FlagM/x87_f64.json
+@@ -13,7 +13,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fadd dword [rax]": {
+diff --git a/unittests/InstructionCountCI/H0F38.json b/unittests/InstructionCountCI/H0F38.json
+index 6c66953..c7f9f2e 100644
+--- a/unittests/InstructionCountCI/H0F38.json
++++ b/unittests/InstructionCountCI/H0F38.json
+@@ -10,7 +10,7 @@
+       "FLAGM2",
+       "CRYPTO"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pshufb mm0, mm1": {
+diff --git a/unittests/InstructionCountCI/H0F3A.json b/unittests/InstructionCountCI/H0F3A.json
+index 759e061..38e6060 100644
+--- a/unittests/InstructionCountCI/H0F3A.json
++++ b/unittests/InstructionCountCI/H0F3A.json
+@@ -8,7 +8,7 @@
+       "AFP",
+       "CRYPTO"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "SSE4.2 string instructions are skipped here.",
+diff --git a/unittests/InstructionCountCI/H0F3A_SVE128.json b/unittests/InstructionCountCI/H0F3A_SVE128.json
+index 2542dda..cc98be9 100644
+--- a/unittests/InstructionCountCI/H0F3A_SVE128.json
++++ b/unittests/InstructionCountCI/H0F3A_SVE128.json
+@@ -8,7 +8,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "dpps xmm0, xmm1, 00000000b": {
+diff --git a/unittests/InstructionCountCI/MOPS/Primary.json b/unittests/InstructionCountCI/MOPS/Primary.json
+index 3e6afcc..84265e1 100644
+--- a/unittests/InstructionCountCI/MOPS/Primary.json
++++ b/unittests/InstructionCountCI/MOPS/Primary.json
+@@ -11,7 +11,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "rep movsb": {
+diff --git a/unittests/InstructionCountCI/Primary.json b/unittests/InstructionCountCI/Primary.json
+index 8755549..6e76f65 100644
+--- a/unittests/InstructionCountCI/Primary.json
++++ b/unittests/InstructionCountCI/Primary.json
+@@ -10,7 +10,7 @@
+       "FLAGM2",
+       "MOPS"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "add bl, cl": {
+diff --git a/unittests/InstructionCountCI/PrimaryGroup.json b/unittests/InstructionCountCI/PrimaryGroup.json
+index eadbb53..2cbb749 100644
+--- a/unittests/InstructionCountCI/PrimaryGroup.json
++++ b/unittests/InstructionCountCI/PrimaryGroup.json
+@@ -9,7 +9,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "Instructions in this table that are marked optimal don't have their flag calculation part of this assumption",
+@@ -2546,9 +2546,21 @@
+       ]
+     },
+     "div bl": {
+-      "ExpectedInstructionCount": 6,
++      "ExpectedInstructionCount": 18,
+       "Comment": "GROUP2 0xf6 /6",
+       "ExpectedArm64ASM": [
++        "ubfx x20, x4, #8, #8",
++        "uxtb x21, w6",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxtb w20, w6",
+         "uxth w23, w4",
+         "udiv w22, w23, w20",
+@@ -2558,16 +2570,70 @@
+       ]
+     },
+     "idiv bl": {
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 61,
+       "Comment": "GROUP2 0xf6 /7",
+       "ExpectedArm64ASM": [
++        "uxtb w20, w6",
++        "cbz w20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "sxth x20, w4",
++        "sxtb x21, w4",
++        "eor x20, x20, x21",
++        "cbnz x20, #+0x60",
++        "sxtb x20, w4",
++        "uxtb w21, w6",
++        "sxtb x21, w21",
++        "eor x20, x20, #0xffffffffffffff80",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxtb w20, w6",
+         "sxth x23, w4",
+         "sxtb x20, w20",
+         "sdiv x22, x23, x20",
+         "msub x21, x22, x20, x23",
+         "bfi x22, x21, #8, #8",
+-        "bfxil x4, x22, #0, #16"
++        "bfxil x4, x22, #0, #16",
++        "b #+0x64",
++        "uxtb w20, w6",
++        "sxth x23, w4",
++        "sxtb x20, w20",
++        "sdiv x22, x23, x20",
++        "msub x21, x22, x20, x23",
++        "sxtb x20, w22",
++        "eor x20, x22, x20",
++        "neg x23, x20",
++        "orr x20, x20, x23",
++        "asr x20, x20, #63",
++        "bfi x22, x21, #8, #8",
++        "eor x21, x22, x4",
++        "and x21, x21, x20",
++        "eor x21, x22, x21",
++        "bfxil x4, x21, #0, #16",
++        "cbnz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "test bx, 1": {
+@@ -2754,9 +2820,21 @@
+       ]
+     },
+     "div bx": {
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 19,
+       "Comment": "GROUP2 0xf7 /6",
+       "ExpectedArm64ASM": [
++        "uxth x20, w5",
++        "uxth x21, w6",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxth w20, w6",
+         "uxth w0, w4",
+         "bfi w0, w5, #16, #16",
+@@ -2767,9 +2845,21 @@
+       ]
+     },
+     "div ebx": {
+-      "ExpectedInstructionCount": 7,
++      "ExpectedInstructionCount": 19,
+       "Comment": "GROUP2 0xf7 /6",
+       "ExpectedArm64ASM": [
++        "mov w20, w5",
++        "mov w21, w6",
++        "sub x20, x20, x21",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "mov w1, w6",
+         "mov x0, x4",
+         "bfi x0, x5, #32, #32",
+@@ -2780,9 +2870,23 @@
+       ]
+     },
+     "div rbx": {
+-      "ExpectedInstructionCount": 15,
++      "ExpectedInstructionCount": 29,
+       "Comment": "GROUP2 0xf7 /6",
+       "ExpectedArm64ASM": [
++        "sub x20, x5, x6",
++        "bic x21, x6, x5",
++        "eor x22, x5, x6",
++        "bic x20, x20, x22",
++        "orr x20, x21, x20",
++        "tbz x20, #63, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "cbz x5, #+0x2c",
+         "mov x0, x5",
+         "mov x1, x4",
+@@ -2801,9 +2905,38 @@
+       ]
+     },
+     "idiv bx": {
+-      "ExpectedInstructionCount": 8,
++      "ExpectedInstructionCount": 67,
+       "Comment": "GROUP2 0xf7 /7",
+       "ExpectedArm64ASM": [
++        "uxth w20, w6",
++        "cbz w20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "sbfx x20, x4, #15, #1",
++        "sxth x21, w5",
++        "eor x20, x21, x20",
++        "cbnz x20, #+0x64",
++        "sxth x20, w4",
++        "uxth w21, w6",
++        "sxth x21, w21",
++        "eor x20, x20, #0xffffffffffff8000",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "uxth w20, w6",
+         "uxth w0, w4",
+         "bfi w0, w5, #16, #16",
+@@ -2811,13 +2944,72 @@
+         "sdiv w22, w0, w1",
+         "msub w21, w22, w1, w0",
+         "bfxil x4, x22, #0, #16",
+-        "bfxil x5, x21, #0, #16"
++        "bfxil x5, x21, #0, #16",
++        "b #+0x78",
++        "uxth w20, w6",
++        "uxth w0, w4",
++        "bfi w0, w5, #16, #16",
++        "sxth w1, w20",
++        "sdiv w22, w0, w1",
++        "msub w21, w22, w1, w0",
++        "sxtw x20, w22",
++        "sxth x23, w22",
++        "eor x20, x20, x23",
++        "neg x23, x20",
++        "orr x20, x20, x23",
++        "asr x20, x20, #63",
++        "eor x23, x22, x4",
++        "and x23, x23, x20",
++        "eor x22, x22, x23",
++        "bfxil x4, x22, #0, #16",
++        "eor x22, x21, x5",
++        "and x22, x22, x20",
++        "eor x21, x21, x22",
++        "bfxil x5, x21, #0, #16",
++        "cbnz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "idiv ebx": {
+-      "ExpectedInstructionCount": 8,
++      "ExpectedInstructionCount": 66,
+       "Comment": "GROUP2 0xf7 /7",
+       "ExpectedArm64ASM": [
++        "mov w20, w6",
++        "cbz w20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "sbfx x20, x4, #31, #1",
++        "sxtw x21, w5",
++        "eor x20, x21, x20",
++        "cbnz x20, #+0x64",
++        "sxtw x20, w4",
++        "mov w21, w6",
++        "sxtw x21, w21",
++        "eor x20, x20, #0xffffffff80000000",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "mov w20, w6",
+         "mov x0, x4",
+         "bfi x0, x5, #32, #32",
+@@ -2825,13 +3017,69 @@
+         "sdiv x22, x0, x1",
+         "msub x21, x22, x1, x0",
+         "mov w4, w22",
+-        "mov w5, w21"
++        "mov w5, w21",
++        "b #+0x74",
++        "mov w20, w6",
++        "mov x0, x4",
++        "bfi x0, x5, #32, #32",
++        "sxtw x1, w20",
++        "sdiv x22, x0, x1",
++        "msub x21, x22, x1, x0",
++        "sxtw x20, w22",
++        "eor x20, x22, x20",
++        "neg x23, x20",
++        "orr x20, x20, x23",
++        "asr x20, x20, #63",
++        "mov w22, w22",
++        "mov w21, w21",
++        "eor x23, x22, x4",
++        "and x23, x23, x20",
++        "eor x4, x22, x23",
++        "eor x22, x21, x5",
++        "and x22, x22, x20",
++        "eor x5, x21, x22",
++        "cbnz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "idiv rbx": {
+-      "ExpectedInstructionCount": 17,
++      "ExpectedInstructionCount": 91,
+       "Comment": "GROUP2 0xf7 /7",
+       "ExpectedArm64ASM": [
++        "cbz x6, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
++        "asr x20, x4, #63",
++        "asr x21, x5, #0",
++        "eor x20, x21, x20",
++        "cbnz x20, #+0x84",
++        "asr x20, x4, #0",
++        "asr x21, x6, #0",
++        "eor x20, x20, #0x8000000000000000",
++        "add x21, x21, #0x1 (1)",
++        "orr x20, x20, x21",
++        "cbz x20, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0",
+         "asr x0, x4, #63",
+         "eor x0, x0, x5",
+         "cbz x0, #+0x2c",
+@@ -2848,7 +3096,54 @@
+         "sdiv x20, x4, x6",
+         "msub x22, x20, x6, x4",
+         "mov x5, x22",
+-        "mov x4, x20"
++        "mov x4, x20",
++        "b #+0xbc",
++        "asr x0, x4, #63",
++        "eor x0, x0, x5",
++        "cbz x0, #+0x2c",
++        "mov x0, x5",
++        "mov x1, x4",
++        "mov x2, x6",
++        "ldr x3, [x28, #3056]",
++        "str x30, [sp, #-16]!",
++        "blr x3",
++        "ldr x30, [sp], #16",
++        "mov x20, x0",
++        "mov x22, x1",
++        "b #+0xc",
++        "sdiv x20, x4, x6",
++        "msub x22, x20, x6, x4",
++        "mul x21, x20, x6",
++        "add x23, x21, x22",
++        "sub x24, x23, x21",
++        "bic x30, x21, x23",
++        "eor x21, x23, x21",
++        "bic x21, x24, x21",
++        "orr x21, x30, x21",
++        "smulh x23, x20, x6",
++        "asr x24, x22, #63",
++        "add x23, x23, x24",
++        "lsr x21, x21, #63",
++        "add x21, x23, x21",
++        "eor x21, x21, x5",
++        "neg x23, x21",
++        "orr x21, x21, x23",
++        "asr x21, x21, #63",
++        "eor x23, x20, x4",
++        "and x23, x23, x21",
++        "eor x4, x20, x23",
++        "eor x20, x22, x5",
++        "and x20, x20, x21",
++        "eor x5, x22, x20",
++        "cbnz x21, #+0x8",
++        "b #+0x20",
++        "mov w20, #0x10000",
++        "str x20, [x28, #24]",
++        "mov w0, #0x801",
++        "movk w0, #0x100, lsl #16",
++        "str x0, [x28, #1496]",
++        "ldr x0, [x28, #3008]",
++        "br x0"
+       ]
+     },
+     "inc al": {
+diff --git a/unittests/InstructionCountCI/Primary_32Bit.json b/unittests/InstructionCountCI/Primary_32Bit.json
+index ea11c2c..5d2e509 100644
+--- a/unittests/InstructionCountCI/Primary_32Bit.json
++++ b/unittests/InstructionCountCI/Primary_32Bit.json
+@@ -9,7 +9,7 @@
+       "FlagM",
+       "FlagM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "push es": {
+diff --git a/unittests/InstructionCountCI/RPRES/DDD.json b/unittests/InstructionCountCI/RPRES/DDD.json
+index f7ef9e1..5805d43 100644
+--- a/unittests/InstructionCountCI/RPRES/DDD.json
++++ b/unittests/InstructionCountCI/RPRES/DDD.json
+@@ -9,7 +9,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pfrcpv mm0, mm1": {
+diff --git a/unittests/InstructionCountCI/RPRES/Secondary.json b/unittests/InstructionCountCI/RPRES/Secondary.json
+index 83db2be..f0a5907 100644
+--- a/unittests/InstructionCountCI/RPRES/Secondary.json
++++ b/unittests/InstructionCountCI/RPRES/Secondary.json
+@@ -9,7 +9,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "rsqrtps xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/RPRES/Secondary_REP_AFP.json b/unittests/InstructionCountCI/RPRES/Secondary_REP_AFP.json
+index 97623e6..e3a7203 100644
+--- a/unittests/InstructionCountCI/RPRES/Secondary_REP_AFP.json
++++ b/unittests/InstructionCountCI/RPRES/Secondary_REP_AFP.json
+@@ -9,7 +9,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "rsqrtss xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/RPRES/VEX_map1_AFP.json b/unittests/InstructionCountCI/RPRES/VEX_map1_AFP.json
+index fb018a0..0f79349 100644
+--- a/unittests/InstructionCountCI/RPRES/VEX_map1_AFP.json
++++ b/unittests/InstructionCountCI/RPRES/VEX_map1_AFP.json
+@@ -8,7 +8,7 @@
+       "AFP"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vrsqrtps xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Repeat.json b/unittests/InstructionCountCI/Repeat.json
+index 5524a54..6cf2f50 100644
+--- a/unittests/InstructionCountCI/Repeat.json
++++ b/unittests/InstructionCountCI/Repeat.json
+@@ -6,7 +6,7 @@
+       "SVE128",
+       "SVE256"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {}
+ }
+diff --git a/unittests/InstructionCountCI/SSE42_Strings.json b/unittests/InstructionCountCI/SSE42_Strings.json
+index c66b86c..bf50f49 100644
+--- a/unittests/InstructionCountCI/SSE42_Strings.json
++++ b/unittests/InstructionCountCI/SSE42_Strings.json
+@@ -33,7 +33,7 @@
+       "      - 1b: ECX = MSB",
+       "[7]   - Reserved"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pcmpestrm xmm0, xmm1, 0_0_00_00_00b": {
+diff --git a/unittests/InstructionCountCI/Secondary.json b/unittests/InstructionCountCI/Secondary.json
+index 97173a7..ffcdc7c 100644
+--- a/unittests/InstructionCountCI/Secondary.json
++++ b/unittests/InstructionCountCI/Secondary.json
+@@ -12,7 +12,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Comment": [
+     "MMX instructions are defined as optimal without SRA being used for these instructions.",
+diff --git a/unittests/InstructionCountCI/SecondaryGroup.json b/unittests/InstructionCountCI/SecondaryGroup.json
+index 7912df5..b315836 100644
+--- a/unittests/InstructionCountCI/SecondaryGroup.json
++++ b/unittests/InstructionCountCI/SecondaryGroup.json
+@@ -11,7 +11,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "sgdt [rax]": {
+diff --git a/unittests/InstructionCountCI/SecondaryModRM.json b/unittests/InstructionCountCI/SecondaryModRM.json
+index 7d8789c..f52cf85 100644
+--- a/unittests/InstructionCountCI/SecondaryModRM.json
++++ b/unittests/InstructionCountCI/SecondaryModRM.json
+@@ -11,7 +11,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "xgetbv": {
+diff --git a/unittests/InstructionCountCI/Secondary_32Bit.json b/unittests/InstructionCountCI/Secondary_32Bit.json
+index 4b731a2..cfd0d3d 100644
+--- a/unittests/InstructionCountCI/Secondary_32Bit.json
++++ b/unittests/InstructionCountCI/Secondary_32Bit.json
+@@ -7,7 +7,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "push fs": {
+diff --git a/unittests/InstructionCountCI/Secondary_OpSize.json b/unittests/InstructionCountCI/Secondary_OpSize.json
+index 621c1b1..0749c99 100644
+--- a/unittests/InstructionCountCI/Secondary_OpSize.json
++++ b/unittests/InstructionCountCI/Secondary_OpSize.json
+@@ -12,7 +12,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "movupd xmm0, xmm0": {
+diff --git a/unittests/InstructionCountCI/Secondary_OpSize_FCMA.json b/unittests/InstructionCountCI/Secondary_OpSize_FCMA.json
+index e32dc20..527e7d1 100644
+--- a/unittests/InstructionCountCI/Secondary_OpSize_FCMA.json
++++ b/unittests/InstructionCountCI/Secondary_OpSize_FCMA.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "addsubpd xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_OpSize_SVE128.json b/unittests/InstructionCountCI/Secondary_OpSize_SVE128.json
+index e836996..e6d6dd5 100644
+--- a/unittests/InstructionCountCI/Secondary_OpSize_SVE128.json
++++ b/unittests/InstructionCountCI/Secondary_OpSize_SVE128.json
+@@ -8,7 +8,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "psrlw xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_OpSize_SVE256.json b/unittests/InstructionCountCI/Secondary_OpSize_SVE256.json
+index 633a103..515b484 100644
+--- a/unittests/InstructionCountCI/Secondary_OpSize_SVE256.json
++++ b/unittests/InstructionCountCI/Secondary_OpSize_SVE256.json
+@@ -7,7 +7,7 @@
+       "AFP"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pmulhuw xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_REP.json b/unittests/InstructionCountCI/Secondary_REP.json
+index ca47071..95b0b5b 100644
+--- a/unittests/InstructionCountCI/Secondary_REP.json
++++ b/unittests/InstructionCountCI/Secondary_REP.json
+@@ -12,7 +12,7 @@
+       "FRINTTS",
+       "CSSC"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "movss xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_REPNE.json b/unittests/InstructionCountCI/Secondary_REPNE.json
+index 965f953..5075c00 100644
+--- a/unittests/InstructionCountCI/Secondary_REPNE.json
++++ b/unittests/InstructionCountCI/Secondary_REPNE.json
+@@ -10,7 +10,7 @@
+       "FCMA",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "movsd xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_REPNE_FCMA.json b/unittests/InstructionCountCI/Secondary_REPNE_FCMA.json
+index 899d323..84a89fb 100644
+--- a/unittests/InstructionCountCI/Secondary_REPNE_FCMA.json
++++ b/unittests/InstructionCountCI/Secondary_REPNE_FCMA.json
+@@ -9,7 +9,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "addsubps xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_REPNE_SVE128.json b/unittests/InstructionCountCI/Secondary_REPNE_SVE128.json
+index c716281..77c4661 100644
+--- a/unittests/InstructionCountCI/Secondary_REPNE_SVE128.json
++++ b/unittests/InstructionCountCI/Secondary_REPNE_SVE128.json
+@@ -10,7 +10,7 @@
+       "FCMA",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvtpd2dq xmm0, xmm1": {
+diff --git a/unittests/InstructionCountCI/Secondary_REP_FRINTTS.json b/unittests/InstructionCountCI/Secondary_REP_FRINTTS.json
+index 5899a13..4040e1b 100644
+--- a/unittests/InstructionCountCI/Secondary_REP_FRINTTS.json
++++ b/unittests/InstructionCountCI/Secondary_REP_FRINTTS.json
+@@ -12,7 +12,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "cvttss2si eax, xmm0": {
+diff --git a/unittests/InstructionCountCI/Secondary_SVE128.json b/unittests/InstructionCountCI/Secondary_SVE128.json
+index c2c8f40..cf37eac 100644
+--- a/unittests/InstructionCountCI/Secondary_SVE128.json
++++ b/unittests/InstructionCountCI/Secondary_SVE128.json
+@@ -8,7 +8,7 @@
+       "SVE256",
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "movmskps eax, xmm0": {
+diff --git a/unittests/InstructionCountCI/VEX_map1.json b/unittests/InstructionCountCI/VEX_map1.json
+index 376c536..0eff63f 100644
+--- a/unittests/InstructionCountCI/VEX_map1.json
++++ b/unittests/InstructionCountCI/VEX_map1.json
+@@ -13,7 +13,7 @@
+       "FLAGM2",
+       "FRINTTS"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vmovups xmm0, xmm0": {
+diff --git a/unittests/InstructionCountCI/VEX_map1_FCMA.json b/unittests/InstructionCountCI/VEX_map1_FCMA.json
+index ad11fda..c76a4f3 100644
+--- a/unittests/InstructionCountCI/VEX_map1_FCMA.json
++++ b/unittests/InstructionCountCI/VEX_map1_FCMA.json
+@@ -8,7 +8,7 @@
+       "FCMA"
+     ],
+     "DisabledHostFeatures": [],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vaddsubpd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/VEX_map1_FRINTTS.json b/unittests/InstructionCountCI/VEX_map1_FRINTTS.json
+index 243b346..fbe3f0a 100644
+--- a/unittests/InstructionCountCI/VEX_map1_FRINTTS.json
++++ b/unittests/InstructionCountCI/VEX_map1_FRINTTS.json
+@@ -13,7 +13,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vcvttss2si eax, xmm0": {
+diff --git a/unittests/InstructionCountCI/VEX_map2.json b/unittests/InstructionCountCI/VEX_map2.json
+index 376b538..4eb7137 100644
+--- a/unittests/InstructionCountCI/VEX_map2.json
++++ b/unittests/InstructionCountCI/VEX_map2.json
+@@ -13,7 +13,7 @@
+       "I8MM",
+       "DOTPROD"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpshufb xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/VEX_map2_DOTPROD.json b/unittests/InstructionCountCI/VEX_map2_DOTPROD.json
+index 256aefa..fda5997 100644
+--- a/unittests/InstructionCountCI/VEX_map2_DOTPROD.json
++++ b/unittests/InstructionCountCI/VEX_map2_DOTPROD.json
+@@ -13,7 +13,7 @@
+       "SVEBITPERM",
+       "I8MM"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpdpbusd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/VEX_map2_I8MM.json b/unittests/InstructionCountCI/VEX_map2_I8MM.json
+index 6078a4a..67879c6 100644
+--- a/unittests/InstructionCountCI/VEX_map2_I8MM.json
++++ b/unittests/InstructionCountCI/VEX_map2_I8MM.json
+@@ -12,7 +12,7 @@
+       "FLAGM2",
+       "SVEBITPERM"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpdpbusd xmm0, xmm1, xmm2": {
+diff --git a/unittests/InstructionCountCI/VEX_map2_svebitperm.json b/unittests/InstructionCountCI/VEX_map2_svebitperm.json
+index 52d848e..4cd2b5e 100644
+--- a/unittests/InstructionCountCI/VEX_map2_svebitperm.json
++++ b/unittests/InstructionCountCI/VEX_map2_svebitperm.json
+@@ -11,7 +11,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "pext eax, ebx, ecx": {
+diff --git a/unittests/InstructionCountCI/VEX_map3.json b/unittests/InstructionCountCI/VEX_map3.json
+index dcb6700..a481c6f 100644
+--- a/unittests/InstructionCountCI/VEX_map3.json
++++ b/unittests/InstructionCountCI/VEX_map3.json
+@@ -8,7 +8,7 @@
+     "DisabledHostFeatures": [
+       "AFP"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpermq ymm0, ymm1, 1": {
+diff --git a/unittests/InstructionCountCI/VEX_map_group.json b/unittests/InstructionCountCI/VEX_map_group.json
+index a9bfd39..e99ccd9 100644
+--- a/unittests/InstructionCountCI/VEX_map_group.json
++++ b/unittests/InstructionCountCI/VEX_map_group.json
+@@ -9,7 +9,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "vpsrlw xmm0, xmm1, 0": {
+diff --git a/unittests/InstructionCountCI/X87ldst-SVE.json b/unittests/InstructionCountCI/X87ldst-SVE.json
+index 42df460..d5098fa 100644
+--- a/unittests/InstructionCountCI/X87ldst-SVE.json
++++ b/unittests/InstructionCountCI/X87ldst-SVE.json
+@@ -11,7 +11,7 @@
+       "FLAGM2",
+       "RPRES"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fstp tword [rax]": {
+diff --git a/unittests/InstructionCountCI/x87.json b/unittests/InstructionCountCI/x87.json
+index 7567395..bd51d2d 100644
+--- a/unittests/InstructionCountCI/x87.json
++++ b/unittests/InstructionCountCI/x87.json
+@@ -10,7 +10,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fadd dword [rax]": {
+diff --git a/unittests/InstructionCountCI/x87_32Bit.json b/unittests/InstructionCountCI/x87_32Bit.json
+index eaa2a89..c836a75 100644
+--- a/unittests/InstructionCountCI/x87_32Bit.json
++++ b/unittests/InstructionCountCI/x87_32Bit.json
+@@ -10,7 +10,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "Multiple fld/fst": {
+diff --git a/unittests/InstructionCountCI/x87_f64.json b/unittests/InstructionCountCI/x87_f64.json
+index e294b05..89e1b5d 100644
+--- a/unittests/InstructionCountCI/x87_f64.json
++++ b/unittests/InstructionCountCI/x87_f64.json
+@@ -12,7 +12,7 @@
+       "FLAGM",
+       "FLAGM2"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fadd dword [rax]": {
+diff --git a/unittests/InstructionCountCI/x87_f64_32Bit.json b/unittests/InstructionCountCI/x87_f64_32Bit.json
+index 2b1cfeb..4acff71 100644
+--- a/unittests/InstructionCountCI/x87_f64_32Bit.json
++++ b/unittests/InstructionCountCI/x87_f64_32Bit.json
+@@ -15,7 +15,7 @@
+       "SVE256",
+       "CSSC"
+     ],
+-    "BinaryCacheVersion": 30
++    "BinaryCacheVersion": 31
+   },
+   "Instructions": {
+     "fstp dword [ebx*4+0x204a20]": {
+-- 
+2.44.0
+

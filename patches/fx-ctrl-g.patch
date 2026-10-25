@@ -1,0 +1,56 @@
+diff --git a/host/launcher/Sources/steamac-vm/SettingsWindow.swift b/host/launcher/Sources/steamac-vm/SettingsWindow.swift
+index 5a0b70d..22ee8ba 100644
+--- a/host/launcher/Sources/steamac-vm/SettingsWindow.swift
++++ b/host/launcher/Sources/steamac-vm/SettingsWindow.swift
+@@ -518,7 +518,7 @@ private struct MouseTab: View {
+                            detail: String(localized: "While a game has focus, a click captures the pointer (relative motion for mouse-look)."),
+                            now: true, key: .autoCaptureGames)
+                 }
+-                LabeledContent("Release the mouse") { Text("Ctrl+Option  (Ctrl+Cmd+G toggles)").foregroundStyle(.secondary) }
++                LabeledContent("Release the mouse") { Text("Ctrl+Option  (Ctrl+G toggles)").foregroundStyle(.secondary) }
+                 LabeledContent("Steam UI and desktop") {
+                     Text("pointer follows the Mac cursor 1:1 (fixed)").foregroundStyle(.secondary)
+                 }
+diff --git a/host/launcher/Sources/steamac-vm/Window.swift b/host/launcher/Sources/steamac-vm/Window.swift
+index bd2cb51..6fa4ccf 100644
+--- a/host/launcher/Sources/steamac-vm/Window.swift
++++ b/host/launcher/Sources/steamac-vm/Window.swift
+@@ -644,6 +644,11 @@ final class WindowController: NSObject, NSWindowDelegate {
+         switch e.type {
+         case .keyDown:
+             userInput("key")
++            if Int(e.keyCode) == kVK_ANSI_G,
++               mods.intersection([.control, .command, .option, .shift]) == .control {
++                if !e.isARepeat { toggleCaptureNow(nil) }
++                return true
++            }
+             if mods.contains([.control, .command]) {
+                 switch Int(e.keyCode) {
+                 case kVK_ANSI_F: toggleFullScreen(); return true
+@@ -783,7 +788,7 @@ final class WindowController: NSObject, NSWindowDelegate {
+         updateTitle()
+         if let id = focusedGame, mouseMode == .auto {
+             flashStatus(settings.autoCapture(for: id) ? String(localized: "click to capture the mouse (Ctrl+Option releases)")
+-                                                      : String(localized: "auto-capture off for \(gameLabel(id)) (Ctrl+Cmd+G captures)"))
++                                                      : String(localized: "auto-capture off for \(gameLabel(id)) (Ctrl+G captures)"))
+         }
+     }
+ 
+@@ -830,7 +835,7 @@ final class WindowController: NSObject, NSWindowDelegate {
+         let entries: [(LocalizedStringResource, Selector)] = [
+             ("Capture Mouse in This Game", #selector(toggleGameAutoCapture(_:))),
+             ("Auto-Capture Mouse in Games", #selector(toggleGlobalAutoCapture(_:))),
+-            ("Capture / Release Mouse Now (Ctrl+Cmd+G)", #selector(toggleCaptureNow(_:))),
++            ("Capture / Release Mouse Now (Ctrl+G)", #selector(toggleCaptureNow(_:))),
+         ]
+         for (title, action) in entries {
+             let i = NSMenuItem(title: String(localized: title), action: action, keyEquivalent: "")
+@@ -1107,7 +1112,7 @@ enum MainMenu {
+         let viewMenu = NSMenu(title: String(localized: "View", comment: "Menu for display controls"))
+         viewItem.submenu = viewMenu
+         viewMenu.addItem(item("Toggle Full Screen (Ctrl+Cmd+F)", fullscreen, target))
+-        viewMenu.addItem(item("Grab Pointer (Ctrl+Cmd+G; Ctrl+Option releases)", grab, target))
++        viewMenu.addItem(item("Grab Pointer (Ctrl+G; Ctrl+Option releases)", grab, target))
+         viewMenu.addItem(item("Show Boot Progress", overlay, target))
+         // Ticked by the target's validateMenuItem (follows Settings > Display and Ctrl+Cmd+P).
+         viewMenu.addItem(item("Show Metal Performance HUD (Ctrl+Cmd+P)", metalHUD, target))
